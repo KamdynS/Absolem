@@ -2,6 +2,43 @@
 name = "absolem"
 version = "0.1.0"
 edition = "2024"
+license = "TBD"
+repository = "TBD"
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive"] }
+
+[lints.clippy]
+# Groups (priority -1 so individual lints below can override them).
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+cargo    = { level = "warn", priority = -1 }
+
+# --- Pedantic lints that are usually more noise than signal ---
+module_name_repetitions  = "allow"  # foo::FooError is fine
+must_use_candidate       = "allow"
+missing_errors_doc       = "allow"  # revisit when there's a public library boundary
+missing_panics_doc       = "allow"
+cast_precision_loss      = "allow"
+cast_possible_truncation = "allow"
+
+# --- Cherry-picked restriction lints ---
+dbg_macro          = "warn"
+todo               = "warn"
+unimplemented      = "warn"
+unwrap_used        = "warn"
+expect_used        = "warn"
+panic              = "warn"
+mem_forget         = "warn"
+float_cmp_const    = "warn"
+string_to_string   = "warn"
+str_to_string      = "warn"
+
+# --- Capability-injection backstop (docs/STYLE.md §3) ---
+# These catch ambient effects in code that should take a capability instead.
+print_stdout       = "warn"
+print_stderr       = "warn"
+exit               = "warn"
+
+[lints.rust]
+unsafe_code        = "forbid"
+unreachable_pub    = "warn"
