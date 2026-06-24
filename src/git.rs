@@ -1,8 +1,4 @@
 //! The `GitRepo` capability and its real shell-out-to-`git` implementation.
-//!
-//! Per `docs/STYLE.md` §3, callers take the trait by `impl GitRepo` so
-//! tests can swap in an in-memory fake. Only the composition root
-//! (`main.rs`) constructs a `RealGit`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

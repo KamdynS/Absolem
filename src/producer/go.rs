@@ -64,13 +64,21 @@ fn extract_into(node: Node<'_>, source: &str, out: &mut Vec<Decl>) {
             }
         }
         "const_declaration" => out.push(Decl {
-            signature: normalize_whitespace(&source[node.byte_range()]),
+            signature: source[node.byte_range()]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             kind: Kind::Const,
         }),
         "var_declaration" => out.push(Decl {
-            signature: normalize_whitespace(&source[node.byte_range()]),
+            signature: source[node.byte_range()]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             kind: Kind::Var,
         }),
+        // Skipped: `package_clause`, `import_declaration`, `comment`,
+        // and `ERROR` nodes. None contribute API shape.
         _ => {}
     }
 }
@@ -101,10 +109,6 @@ fn type_spec_decl(spec: Node<'_>, source: &str) -> Option<Decl> {
         }
     };
     Some(Decl { signature, kind })
-}
-
-fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

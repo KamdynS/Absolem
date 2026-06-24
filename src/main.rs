@@ -1,7 +1,4 @@
 //! `absolem` entrypoint and composition root.
-//!
-//! Per `docs/STYLE.md` §3.1.4, real capabilities are constructed only
-//! here; everything else takes them by `impl Trait`.
 
 mod decl;
 mod git;
