@@ -16,7 +16,7 @@ use clap::Parser;
 
 use crate::core::{FileChange, FileChangeKind, diff};
 use crate::git::{ChangeStatus, ChangedFile, GitRepo, RealGit};
-use crate::producer::go::{GoError, GoProducer};
+use crate::producer::{Producer, ProducerError, Registry};
 use crate::surface::Surface;
 
 #[derive(Parser, Debug)]
@@ -43,13 +43,13 @@ fn main() -> Result<()> {
         .changed_files(&base, "HEAD")
         .with_context(|| format!("git diff {base}...HEAD failed"))?;
 
-    let go_files: Vec<_> = changed
+    let mut registry = Registry::with_defaults().context("failed to initialize parsers")?;
+    let source_files: Vec<_> = changed
         .into_iter()
-        .filter(|f| f.path.extension().is_some_and(|e| e == "go"))
+        .filter(|f| registry.supports(&f.path))
         .collect();
 
-    let mut producer = GoProducer::new().context("failed to initialize Go parser")?;
-    let review = build_review(&git, &mut producer, &base, &go_files)?;
+    let review = build_review(&git, &mut registry, &base, &source_files)?;
 
     if cli.plain || !std::io::stdout().is_terminal() {
         let stdout = std::io::stdout();
@@ -67,31 +67,33 @@ fn main() -> Result<()> {
 /// that survives is worth rendering.
 fn build_review(
     git: &impl GitRepo,
-    producer: &mut GoProducer,
+    registry: &mut Registry,
     base: &str,
     files: &[ChangedFile],
 ) -> Result<Vec<FileChange>> {
     let mut review = Vec::new();
     for file in files {
-        match file.status {
-            ChangeStatus::Deleted => review.push(FileChange {
+        if file.status == ChangeStatus::Deleted {
+            review.push(FileChange {
                 path: file.path.clone(),
                 kind: FileChangeKind::Deleted,
-            }),
-            ChangeStatus::Added | ChangeStatus::Modified => {
-                let base_surface = match file.status {
-                    ChangeStatus::Added => Surface::new(),
-                    _ => surface_at(git, producer, base, &file.path)?,
-                };
-                let head_surface = surface_at(git, producer, "HEAD", &file.path)?;
-                let changeset = diff(&base_surface, &head_surface);
-                if !changeset.is_empty() {
-                    review.push(FileChange {
-                        path: file.path.clone(),
-                        kind: FileChangeKind::Changed(changeset),
-                    });
-                }
-            }
+            });
+            continue;
+        }
+        let Some(producer) = registry.for_path(&file.path) else {
+            continue;
+        };
+        let base_surface = match file.status {
+            ChangeStatus::Added => Surface::new(),
+            _ => surface_at(git, producer, base, &file.path)?,
+        };
+        let head_surface = surface_at(git, producer, "HEAD", &file.path)?;
+        let changeset = diff(&base_surface, &head_surface);
+        if !changeset.is_empty() {
+            review.push(FileChange {
+                path: file.path.clone(),
+                kind: FileChangeKind::Changed(changeset),
+            });
         }
     }
     Ok(review)
@@ -99,7 +101,7 @@ fn build_review(
 
 fn surface_at(
     git: &impl GitRepo,
-    producer: &mut GoProducer,
+    producer: &mut dyn Producer,
     rev: &str,
     path: &Path,
 ) -> Result<Surface> {
@@ -108,7 +110,7 @@ fn surface_at(
         .with_context(|| format!("git show {rev}:{} failed", path.display()))?;
     producer
         .extract(path, &source)
-        .map_err(|e: GoError| anyhow!(e))
+        .map_err(|e: ProducerError| anyhow!(e))
         .with_context(|| format!("failed to parse {}@{rev}", path.display()))
 }
 
@@ -170,8 +172,8 @@ mod tests {
     }
 
     fn render_all(git: &FakeGit) -> String {
-        let mut producer = GoProducer::new().unwrap();
-        let review = build_review(git, &mut producer, "origin/main", &git.files).unwrap();
+        let mut registry = Registry::with_defaults().unwrap();
+        let review = build_review(git, &mut registry, "origin/main", &git.files).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         render::render_review(&mut buf, &review).unwrap();
         String::from_utf8(buf).unwrap()

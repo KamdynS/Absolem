@@ -13,6 +13,7 @@ ratatui = "0.29"
 thiserror = "1.0"
 tree-sitter = "0.24"
 tree-sitter-go = "0.23"
+tree-sitter-rust = "0.23"
 
 [lints.clippy]
 # Groups (priority -1 so individual lints below can override them).

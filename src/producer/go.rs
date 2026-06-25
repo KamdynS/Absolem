@@ -14,29 +14,27 @@ use std::path::Path;
 use tree_sitter::{Node, Parser};
 
 use crate::item::{Item, ItemId, Kind};
+use crate::producer::{Producer, ProducerError};
 use crate::surface::Surface;
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum GoError {
-    #[error("tree-sitter language load failed")]
-    LanguageLoad(#[from] tree_sitter::LanguageError),
-    #[error("tree-sitter returned no tree")]
-    NoTree,
-}
 
 pub(crate) struct GoProducer {
     parser: Parser,
 }
 
 impl GoProducer {
-    pub(crate) fn new() -> Result<Self, GoError> {
+    pub(crate) fn new() -> Result<Self, ProducerError> {
         let mut parser = Parser::new();
         parser.set_language(&tree_sitter_go::LANGUAGE.into())?;
         Ok(Self { parser })
     }
+}
 
-    pub(crate) fn extract(&mut self, path: &Path, source: &str) -> Result<Surface, GoError> {
-        let tree = self.parser.parse(source, None).ok_or(GoError::NoTree)?;
+impl Producer for GoProducer {
+    fn extract(&mut self, path: &Path, source: &str) -> Result<Surface, ProducerError> {
+        let tree = self
+            .parser
+            .parse(source, None)
+            .ok_or(ProducerError::NoTree)?;
         let root = tree.root_node();
         let mut surface = Surface::new();
         let mut cursor = root.walk();
@@ -218,6 +216,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::producer::Producer;
 
     fn extract(source: &str) -> Vec<Item> {
         let mut p = GoProducer::new().unwrap();
