@@ -85,6 +85,8 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
         }
         "const_declaration" => emit_value_specs(node, source, path, Kind::Const, "const", out),
         "var_declaration" => emit_value_specs(node, source, path, Kind::Var, "var", out),
+        // Skipped: `package_clause`, `import_declaration`, `comment`,
+        // and `ERROR` nodes. None contribute API shape.
         _ => {}
     }
 }
