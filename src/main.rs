@@ -6,13 +6,15 @@ mod item;
 mod producer;
 mod render;
 mod surface;
+mod tui;
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use crate::core::diff;
+use crate::core::{FileChange, FileChangeKind, diff};
 use crate::git::{ChangeStatus, ChangedFile, GitRepo, RealGit};
 use crate::producer::go::{GoError, GoProducer};
 use crate::surface::Surface;
@@ -22,10 +24,16 @@ use crate::surface::Surface;
     version,
     about = "Surface the structural shape of a change before review."
 )]
-struct Cli {}
+struct Cli {
+    /// Print plain text instead of opening the interactive view. The
+    /// default already falls back to plain text when stdout is not a
+    /// terminal, so this is for forcing it (e.g. piping into a pager).
+    #[arg(long)]
+    plain: bool,
+}
 
 fn main() -> Result<()> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
     let repo_dir = std::env::current_dir().context("failed to read current working directory")?;
     let git = RealGit::new(repo_dir);
@@ -41,59 +49,52 @@ fn main() -> Result<()> {
         .collect();
 
     let mut producer = GoProducer::new().context("failed to initialize Go parser")?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut first_rendered = true;
+    let review = build_review(&git, &mut producer, &base, &go_files)?;
 
-    for file in &go_files {
-        render_file_diff(
-            &git,
-            &mut producer,
-            &base,
-            file,
-            &mut out,
-            &mut first_rendered,
-        )?;
+    if cli.plain || !std::io::stdout().is_terminal() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        render::render_review(&mut out, &review)?;
+    } else {
+        tui::run(&review).context("interactive view failed")?;
     }
 
     Ok(())
 }
 
-fn render_file_diff(
+/// Diffs each changed file into the review the frontends consume. Files
+/// whose API shape did not move are dropped here, so every `FileChange`
+/// that survives is worth rendering.
+fn build_review(
     git: &impl GitRepo,
     producer: &mut GoProducer,
     base: &str,
-    file: &ChangedFile,
-    out: &mut impl std::io::Write,
-    first_rendered: &mut bool,
-) -> Result<()> {
-    let (base_surface, head_surface) = match file.status {
-        ChangeStatus::Added => (
-            Surface::new(),
-            surface_at(git, producer, "HEAD", &file.path)?,
-        ),
-        ChangeStatus::Deleted => (surface_at(git, producer, base, &file.path)?, Surface::new()),
-        ChangeStatus::Modified => (
-            surface_at(git, producer, base, &file.path)?,
-            surface_at(git, producer, "HEAD", &file.path)?,
-        ),
-    };
-
-    let changeset = diff(&base_surface, &head_surface);
-    if file.status == ChangeStatus::Deleted {
-        if !*first_rendered {
-            render::render_blank(out)?;
+    files: &[ChangedFile],
+) -> Result<Vec<FileChange>> {
+    let mut review = Vec::new();
+    for file in files {
+        match file.status {
+            ChangeStatus::Deleted => review.push(FileChange {
+                path: file.path.clone(),
+                kind: FileChangeKind::Deleted,
+            }),
+            ChangeStatus::Added | ChangeStatus::Modified => {
+                let base_surface = match file.status {
+                    ChangeStatus::Added => Surface::new(),
+                    _ => surface_at(git, producer, base, &file.path)?,
+                };
+                let head_surface = surface_at(git, producer, "HEAD", &file.path)?;
+                let changeset = diff(&base_surface, &head_surface);
+                if !changeset.is_empty() {
+                    review.push(FileChange {
+                        path: file.path.clone(),
+                        kind: FileChangeKind::Changed(changeset),
+                    });
+                }
+            }
         }
-        render::render_deleted(out, &file.path)?;
-        *first_rendered = false;
-    } else if !changeset.is_empty() {
-        if !*first_rendered {
-            render::render_blank(out)?;
-        }
-        render::render_changeset(out, &file.path, &changeset)?;
-        *first_rendered = false;
     }
-    Ok(())
+    Ok(review)
 }
 
 fn surface_at(
@@ -170,19 +171,9 @@ mod tests {
 
     fn render_all(git: &FakeGit) -> String {
         let mut producer = GoProducer::new().unwrap();
+        let review = build_review(git, &mut producer, "origin/main", &git.files).unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        let mut first = true;
-        for file in &git.files {
-            render_file_diff(
-                git,
-                &mut producer,
-                "origin/main",
-                file,
-                &mut buf,
-                &mut first,
-            )
-            .unwrap();
-        }
+        render::render_review(&mut buf, &review).unwrap();
         String::from_utf8(buf).unwrap()
     }
 

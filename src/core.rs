@@ -10,6 +10,8 @@
 //! end. No IO, no language knowledge — this layer never imports
 //! tree-sitter.
 
+use std::path::PathBuf;
+
 use crate::item::Item;
 use crate::surface::Surface;
 
@@ -29,6 +31,23 @@ impl ChangeSet {
     pub(crate) const fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
+}
+
+/// One file's contribution to a review: either it was deleted outright, or
+/// its shape changed in a way worth showing. Built by the composition root
+/// and consumed by frontends — the multi-file aggregate that pairs a
+/// `ChangeSet` with the path it came from. Files whose API shape did not
+/// move are dropped before this stage, so every `FileChange` renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileChange {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: FileChangeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileChangeKind {
+    Deleted,
+    Changed(ChangeSet),
 }
 
 pub(crate) fn diff(base: &Surface, head: &Surface) -> ChangeSet {
