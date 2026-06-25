@@ -6,8 +6,9 @@
 //!
 //! The disambiguator is currently just a string baked into `name`:
 //! plain functions, structs, interfaces, types, consts, vars use their
-//! identifier; methods use `Receiver.Method`. That covers every shape Go
-//! permits at the top level today. Richer disambiguators can extend the
+//! identifier; methods use `Receiver.Method` (Go) or `Type::method` /
+//! `<Type as Trait>::method` (Rust). That covers every shape Go and Rust
+//! permit at the top level today. Richer disambiguators can extend the
 //! type later without breaking the matching contract.
 
 use std::path::PathBuf;
@@ -35,4 +36,11 @@ pub(crate) enum Kind {
     TypeAlias,
     Const,
     Var,
+    // Rust adds these to the shared shapes above. `Enum` and `Trait` are
+    // Rust's analogues to a Go struct/interface; `Static` to a top-level
+    // `var`. They stay distinct so a struct and an enum (or a const and a
+    // static) of the same name never collide on identity.
+    Enum,
+    Trait,
+    Static,
 }
