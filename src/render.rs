@@ -1,33 +1,36 @@
-//! Renders a per-file `ChangeSet` to a writer. Pure: takes
+//! The plain-text frontend: renders a review to a writer. Pure — takes
 //! `&mut impl Write` so tests render to a `Vec<u8>` and assert on the
-//! bytes.
+//! bytes, and so the composition root can point it at stdout or a pipe.
 //!
 //! Convention: `+` added, `-` removed, `~` modified (with the new
 //! signature on the same line and the old one indented beneath). Files
-//! with no API-shape changes do not render at all — suppressing them is
-//! the whole point of the shape view.
+//! are separated by a blank line. The review is pre-filtered, so every
+//! `FileChange` handed in renders — suppressing shapeless files is the
+//! composition root's job, not the frontend's.
 
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::core::{Change, ChangeSet};
+use crate::core::{Change, ChangeSet, FileChange, FileChangeKind};
 
-pub(crate) fn render_blank(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out)
+pub(crate) fn render_review(out: &mut impl Write, review: &[FileChange]) -> io::Result<()> {
+    for (i, file) in review.iter().enumerate() {
+        if i > 0 {
+            writeln!(out)?;
+        }
+        match &file.kind {
+            FileChangeKind::Deleted => render_deleted(out, &file.path)?,
+            FileChangeKind::Changed(changeset) => render_changeset(out, &file.path, changeset)?,
+        }
+    }
+    Ok(())
 }
 
-pub(crate) fn render_deleted(out: &mut impl Write, path: &Path) -> io::Result<()> {
+fn render_deleted(out: &mut impl Write, path: &Path) -> io::Result<()> {
     writeln!(out, "DELETED {}", path.display())
 }
 
-pub(crate) fn render_changeset(
-    out: &mut impl Write,
-    path: &Path,
-    changeset: &ChangeSet,
-) -> io::Result<()> {
-    if changeset.is_empty() {
-        return Ok(());
-    }
+fn render_changeset(out: &mut impl Write, path: &Path, changeset: &ChangeSet) -> io::Result<()> {
     writeln!(out, "{}", path.display())?;
     for change in &changeset.changes {
         match change {
@@ -61,59 +64,71 @@ mod tests {
         }
     }
 
-    fn capture(f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+    fn changed(path: &str, changes: Vec<Change>) -> FileChange {
+        FileChange {
+            path: PathBuf::from(path),
+            kind: FileChangeKind::Changed(ChangeSet { changes }),
+        }
+    }
+
+    fn render(review: &[FileChange]) -> String {
         let mut buf = Vec::new();
-        f(&mut buf).unwrap();
+        render_review(&mut buf, review).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
     #[test]
-    fn deleted_prints_marker() {
-        let s = capture(|out| render_deleted(out, &PathBuf::from("foo.go")));
-        assert_eq!(s, "DELETED foo.go\n");
+    fn empty_review_renders_nothing() {
+        assert_eq!(render(&[]), "");
     }
 
     #[test]
-    fn empty_changeset_renders_nothing() {
-        let cs = ChangeSet::default();
-        let s = capture(|out| render_changeset(out, &PathBuf::from("foo.go"), &cs));
-        assert_eq!(s, "");
+    fn deleted_prints_marker() {
+        let review = vec![FileChange {
+            path: PathBuf::from("foo.go"),
+            kind: FileChangeKind::Deleted,
+        }];
+        assert_eq!(render(&review), "DELETED foo.go\n");
     }
 
     #[test]
     fn added_uses_plus_prefix() {
-        let cs = ChangeSet {
-            changes: vec![Change::Added(item("F", Kind::Function, "func F()"))],
-        };
-        let s = capture(|out| render_changeset(out, &PathBuf::from("a.go"), &cs));
-        assert_eq!(s, "a.go\n  + func F()\n");
+        let review = vec![changed(
+            "a.go",
+            vec![Change::Added(item("F", Kind::Function, "func F()"))],
+        )];
+        assert_eq!(render(&review), "a.go\n  + func F()\n");
     }
 
     #[test]
     fn removed_uses_minus_prefix() {
-        let cs = ChangeSet {
-            changes: vec![Change::Removed(item("F", Kind::Function, "func F()"))],
-        };
-        let s = capture(|out| render_changeset(out, &PathBuf::from("a.go"), &cs));
-        assert_eq!(s, "a.go\n  - func F()\n");
+        let review = vec![changed(
+            "a.go",
+            vec![Change::Removed(item("F", Kind::Function, "func F()"))],
+        )];
+        assert_eq!(render(&review), "a.go\n  - func F()\n");
     }
 
     #[test]
     fn modified_shows_new_then_was_old() {
-        let cs = ChangeSet {
-            changes: vec![Change::Modified {
+        let review = vec![changed(
+            "a.go",
+            vec![Change::Modified {
                 before: item("F", Kind::Function, "func F()"),
                 after: item("F", Kind::Function, "func F(x int)"),
             }],
-        };
-        let s = capture(|out| render_changeset(out, &PathBuf::from("a.go"), &cs));
-        assert_eq!(s, "a.go\n  ~ func F(x int)\n      was: func F()\n");
+        )];
+        assert_eq!(
+            render(&review),
+            "a.go\n  ~ func F(x int)\n      was: func F()\n"
+        );
     }
 
     #[test]
     fn mixed_changes_render_in_changeset_order() {
-        let cs = ChangeSet {
-            changes: vec![
+        let review = vec![changed(
+            "m.go",
+            vec![
                 Change::Added(item("A", Kind::Function, "func A()")),
                 Change::Modified {
                     before: item("B", Kind::Function, "func B()"),
@@ -121,11 +136,25 @@ mod tests {
                 },
                 Change::Removed(item("C", Kind::Function, "func C()")),
             ],
-        };
-        let s = capture(|out| render_changeset(out, &PathBuf::from("m.go"), &cs));
+        )];
         assert_eq!(
-            s,
+            render(&review),
             "m.go\n  + func A()\n  ~ func B(x int)\n      was: func B()\n  - func C()\n"
         );
+    }
+
+    #[test]
+    fn files_separated_by_blank_line() {
+        let review = vec![
+            changed(
+                "a.go",
+                vec![Change::Added(item("A", Kind::Function, "func A()"))],
+            ),
+            FileChange {
+                path: PathBuf::from("b.go"),
+                kind: FileChangeKind::Deleted,
+            },
+        ];
+        assert_eq!(render(&review), "a.go\n  + func A()\n\nDELETED b.go\n");
     }
 }
