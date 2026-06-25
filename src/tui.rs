@@ -56,6 +56,8 @@ enum Motion {
     ViewTop,
     ViewCenter,
     ViewBottom,
+    NextMatch,
+    PrevMatch,
     Quit,
 }
 
@@ -67,6 +69,14 @@ enum ViewSpot {
     Top,
     Middle,
     Bottom,
+}
+
+/// Which keymap is live. `Normal` decodes motions; `Search` accumulates a
+/// query in the bottom border until `Enter` commits or `Esc` cancels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Search,
 }
 
 /// The pending state between keystrokes: a half-typed count and whether a
@@ -143,6 +153,8 @@ impl InputState {
             (false, KeyCode::Char('H')) => Motion::CursorHigh,
             (false, KeyCode::Char('M')) => Motion::CursorMiddle,
             (false, KeyCode::Char('L')) => Motion::CursorLow,
+            (false, KeyCode::Char('n')) => Motion::NextMatch,
+            (false, KeyCode::Char('N')) => Motion::PrevMatch,
             _ => return None,
         };
         Some(motion)
@@ -156,6 +168,8 @@ impl InputState {
 struct App {
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
+    /// Stop indices whose row matched the last committed search.
+    matches: Vec<usize>,
     cursor: usize,
     scroll: u16,
     viewport_height: u16,
@@ -167,6 +181,7 @@ impl App {
         Self {
             lines,
             stops,
+            matches: Vec::new(),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
@@ -209,6 +224,8 @@ impl App {
             Motion::ViewTop => self.scroll_cursor_to(ViewSpot::Top),
             Motion::ViewCenter => self.scroll_cursor_to(ViewSpot::Middle),
             Motion::ViewBottom => self.scroll_cursor_to(ViewSpot::Bottom),
+            Motion::NextMatch => self.next_match(),
+            Motion::PrevMatch => self.prev_match(),
             Motion::Quit => {}
         }
     }
@@ -281,6 +298,35 @@ impl App {
         }
     }
 
+    /// Recomputes the set of matching stops for `query` (case-insensitive
+    /// substring over the rendered row text) and jumps the cursor to the
+    /// first match at or after its current position, wrapping if needed. An
+    /// empty query clears any existing matches.
+    fn search(&mut self, query: &str) {
+        self.matches.clear();
+        if query.is_empty() {
+            return;
+        }
+        let needle = query.to_lowercase();
+        for (i, &line) in self.stops.iter().enumerate() {
+            if line_text(&self.lines[usize::from(line)])
+                .to_lowercase()
+                .contains(&needle)
+            {
+                self.matches.push(i);
+            }
+        }
+        if let Some(&target) = self
+            .matches
+            .iter()
+            .find(|&&m| m >= self.cursor)
+            .or_else(|| self.matches.first())
+        {
+            self.cursor = target;
+            self.scroll_to_cursor();
+        }
+    }
+
     /// `zt` / `zz` / `zb`: scroll so the cursor's item sits at the top,
     /// center, or bottom of the viewport, without moving the cursor. Clamped
     /// so the view never runs past either end.
@@ -293,6 +339,40 @@ impl App {
         };
         self.scroll = line.saturating_sub(offset).min(self.max_scroll());
     }
+
+    fn next_match(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.cursor = self
+            .matches
+            .iter()
+            .find(|&&m| m > self.cursor)
+            .or_else(|| self.matches.first())
+            .copied()
+            .unwrap_or(self.cursor);
+        self.scroll_to_cursor();
+    }
+
+    fn prev_match(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.cursor = self
+            .matches
+            .iter()
+            .rev()
+            .find(|&&m| m < self.cursor)
+            .or_else(|| self.matches.last())
+            .copied()
+            .unwrap_or(self.cursor);
+        self.scroll_to_cursor();
+    }
+}
+
+/// Concatenates a line's spans back into plain text, for substring search.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 /// Turns a review into the styled lines the pane scrolls over and the set of
@@ -357,10 +437,19 @@ pub(crate) fn run(review: &[FileChange]) -> io::Result<()> {
     result
 }
 
+const HELP: &str = " j/k move · ^d/^u/^f/^b scroll · gg/G ends · H/M/L view · zt/zz/zb center · / search · n/N matches · q quit ";
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut input = InputState::default();
+    let mut mode = Mode::Normal;
+    let mut query = String::new();
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
+        let footer = if mode == Mode::Search {
+            format!(" /{query} ")
+        } else {
+            HELP.to_owned()
+        };
+        terminal.draw(|frame| draw(frame, app, &footer))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -368,28 +457,56 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if let Some(motion) = input.feed(key.code, ctrl) {
-            if motion == Motion::Quit {
-                return Ok(());
+        match mode {
+            Mode::Search => match key.code {
+                KeyCode::Esc => {
+                    mode = Mode::Normal;
+                    query.clear();
+                }
+                KeyCode::Enter => {
+                    app.search(&query);
+                    mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                }
+                KeyCode::Char(c) => query.push(c),
+                _ => {}
+            },
+            Mode::Normal => {
+                if !ctrl && key.code == KeyCode::Char('/') {
+                    mode = Mode::Search;
+                    query.clear();
+                } else if let Some(motion) = input.feed(key.code, ctrl) {
+                    if motion == Motion::Quit {
+                        return Ok(());
+                    }
+                    app.apply(motion);
+                }
             }
-            app.apply(motion);
         }
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, footer: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" absolem — shape of the change ")
-        .title_bottom(
-            " j/k move · ^d/^u/^f/^b scroll · gg/G ends · H/M/L view · zt/zz/zb center · q quit ",
-        );
+        .title_bottom(footer);
     // Record the inner height so scroll clamping matches what's on screen,
     // and re-follow the cursor in case a resize moved it out of view.
     app.viewport_height = block.inner(frame.area()).height;
     app.scroll_to_cursor();
 
     let mut lines = app.lines.clone();
+    // Search matches are underlined; the cursor's row reverses on top.
+    for &m in &app.matches {
+        if let Some(&line) = app.stops.get(m)
+            && let Some(rendered) = lines.get_mut(usize::from(line))
+        {
+            rendered.style = rendered.style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
     if !app.stops.is_empty()
         && let Some(line) = lines.get_mut(usize::from(app.cursor_line()))
     {
@@ -727,5 +844,87 @@ mod tests {
         assert_eq!(input.feed(KeyCode::Char('x'), false), None); // zx → nothing
         // State cleared: a following motion decodes normally.
         assert_eq!(input.feed(KeyCode::Char('j'), false), Some(Motion::Down(1)));
+    }
+
+    #[test]
+    fn input_decodes_match_navigation() {
+        let mut input = InputState::default();
+        assert_eq!(
+            input.feed(KeyCode::Char('n'), false),
+            Some(Motion::NextMatch)
+        );
+        assert_eq!(
+            input.feed(KeyCode::Char('N'), false),
+            Some(Motion::PrevMatch)
+        );
+    }
+
+    /// Three files, one item each, so every stop carries a distinct name.
+    fn three_files() -> App {
+        App::new(&[
+            changed("a.go", vec![Change::Added(item("Alpha", "func Alpha()"))]),
+            changed("b.go", vec![Change::Added(item("Beta", "func Beta()"))]),
+            changed("c.go", vec![Change::Added(item("Gamma", "func Gamma()"))]),
+        ])
+    }
+
+    #[test]
+    fn search_collects_matches_and_jumps_to_first() {
+        let mut app = three_files();
+        app.viewport_height = 20;
+        // "func" matches every change row (stops 1, 3, 5); headers don't.
+        app.search("func");
+        assert_eq!(app.matches, vec![1, 3, 5]);
+        assert_eq!(app.cursor, 1); // first match at or after cursor 0
+    }
+
+    #[test]
+    fn search_is_case_insensitive_and_jumps_forward_from_cursor() {
+        let mut app = three_files();
+        app.viewport_height = 20;
+        app.cursor = 4; // sitting on c.go's header
+        app.search("BETA");
+        assert_eq!(app.matches, vec![3]);
+        // No match at/after 4, so it wraps to the first (and only) match.
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn next_and_prev_match_wrap_around() {
+        let mut app = three_files();
+        app.viewport_height = 20;
+        app.search("func"); // matches [1, 3, 5], cursor → 1
+        app.next_match();
+        assert_eq!(app.cursor, 3);
+        app.next_match();
+        assert_eq!(app.cursor, 5);
+        app.next_match(); // wraps to the first
+        assert_eq!(app.cursor, 1);
+        app.prev_match(); // wraps back to the last
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn search_with_no_hits_clears_matches_and_holds_cursor() {
+        let mut app = three_files();
+        app.viewport_height = 20;
+        app.cursor = 2;
+        app.search("func"); // matches [1,3,5]; first at/after 2 is stop 3
+        assert_eq!(app.cursor, 3);
+        app.search("nonexistent");
+        assert!(app.matches.is_empty());
+        // No matches → cursor stays where the last search left it.
+        assert_eq!(app.cursor, 3);
+        app.next_match(); // no-op with no matches
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn empty_query_clears_matches() {
+        let mut app = three_files();
+        app.viewport_height = 20;
+        app.search("func");
+        app.search("");
+        assert!(app.matches.is_empty());
     }
 }
