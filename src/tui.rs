@@ -17,16 +17,17 @@
 //! emulator's theme instead of fighting it. No resolution and no
 //! navigation across refs — just shape, plus a jump out to `$EDITOR`.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Modifier, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView};
+use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView, TypeIndex};
 use crate::item::Line as SourceLine;
 
 /// The authority to open the user's editor at a location. A capability
@@ -54,6 +55,9 @@ struct Rendered {
     stops: Vec<u16>,
     /// Parallel to `stops`: where each stop jumps when opened.
     jumps: Vec<Option<JumpTarget>>,
+    /// Parallel to `stops`: whether the row references a type the index
+    /// can resolve, i.e. whether `Tab` will do anything.
+    expandable: Vec<bool>,
     /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
     headers: Vec<usize>,
 }
@@ -86,6 +90,8 @@ enum Motion {
     /// `{` / `}` — move the cursor to the previous / next file header.
     PrevFile(usize),
     NextFile(usize),
+    /// `Tab` — expand or collapse the types the cursor's item references.
+    Expand,
     /// `Enter` — open the cursor's item in the user's editor.
     Open,
     Quit,
@@ -187,6 +193,7 @@ impl InputState {
             (false, KeyCode::Char('N')) => Motion::PrevMatch,
             (false, KeyCode::Char('{')) => Motion::PrevFile(times),
             (false, KeyCode::Char('}')) => Motion::NextFile(times),
+            (false, KeyCode::Tab) => Motion::Expand,
             (false, KeyCode::Enter) => Motion::Open,
             _ => return None,
         };
@@ -199,10 +206,20 @@ impl InputState {
 /// screen. `viewport_height` is the last drawn body height, recorded each
 /// frame so the motion handlers can clamp without the terminal.
 struct App {
+    /// The review being displayed — kept so the pane can re-render when
+    /// an expansion toggles.
+    review: Vec<FileChange>,
+    /// The head-wide index expansions resolve against.
+    index: TypeIndex,
+    /// Stop indices whose expansion is currently open.
+    expanded: HashSet<usize>,
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
     /// Parallel to `stops`: where each stop jumps when opened.
     jumps: Vec<Option<JumpTarget>>,
+    /// Parallel to `stops`: whether the row has at least one reference
+    /// that resolves in the index.
+    expandable: Vec<bool>,
     /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
     headers: Vec<usize>,
     /// Stop indices whose row matched the last committed search.
@@ -215,24 +232,56 @@ struct App {
 }
 
 impl App {
-    fn new(review: &[FileChange]) -> Self {
-        let Rendered {
-            lines,
-            stops,
-            jumps,
-            headers,
-        } = render_lines(review);
-        Self {
-            lines,
-            stops,
-            jumps,
-            headers,
+    fn new(review: &[FileChange], index: TypeIndex) -> Self {
+        let mut app = Self {
+            review: review.to_vec(),
+            index,
+            expanded: HashSet::new(),
+            lines: Vec::new(),
+            stops: Vec::new(),
+            jumps: Vec::new(),
+            expandable: Vec::new(),
+            headers: Vec::new(),
             matches: Vec::new(),
             summary: summarize(review),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
+        };
+        app.rerender();
+        app
+    }
+
+    /// Rebuilds the display lines from the review and the current
+    /// expansion state. Stops are stable across toggles (expansion rows
+    /// are not stops), so the cursor keeps its position.
+    fn rerender(&mut self) {
+        let Rendered {
+            lines,
+            stops,
+            jumps,
+            expandable,
+            headers,
+        } = render_lines(&self.review, &self.expanded, &self.index);
+        self.lines = lines;
+        self.stops = stops;
+        self.jumps = jumps;
+        self.expandable = expandable;
+        self.headers = headers;
+        self.scroll_to_cursor();
+    }
+
+    /// `Tab`: toggles the cursor row's expansion. Returns a footer
+    /// notice when there is nothing to expand.
+    fn toggle_expand(&mut self) -> Option<String> {
+        if !self.expandable.get(self.cursor).copied().unwrap_or(false) {
+            return Some(" nothing to expand here ".to_owned());
         }
+        if !self.expanded.remove(&self.cursor) {
+            self.expanded.insert(self.cursor);
+        }
+        self.rerender();
+        None
     }
 
     /// Where the cursor's stop leads, if anywhere.
@@ -280,9 +329,9 @@ impl App {
             Motion::PrevMatch => self.prev_match(),
             Motion::PrevFile(n) => self.prev_file(n),
             Motion::NextFile(n) => self.next_file(n),
-            // Open and Quit act on the world outside the pane; the event
-            // loop handles them.
-            Motion::Open | Motion::Quit => {}
+            // Expand, Open, and Quit are handled by the event loop: they
+            // either re-render or act on the world outside the pane.
+            Motion::Expand | Motion::Open | Motion::Quit => {}
         }
     }
 
@@ -470,21 +519,32 @@ struct LineBuilder {
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
     jumps: Vec<Option<JumpTarget>>,
+    expandable: Vec<bool>,
     headers: Vec<usize>,
 }
 
 impl LineBuilder {
     /// Pushes a line the cursor can land on.
-    fn stop(&mut self, line: Line<'static>, jump: Option<JumpTarget>) {
+    fn stop(&mut self, line: Line<'static>, jump: Option<JumpTarget>, expandable: bool) {
         self.stops
             .push(u16::try_from(self.lines.len()).unwrap_or(u16::MAX));
         self.jumps.push(jump);
+        self.expandable.push(expandable);
         self.lines.push(line);
     }
 
     /// One item row at `indent`: status marker and color by status,
-    /// unchanged context dimmed, a modified row's old signature beneath.
-    fn item_row(&mut self, view: &ItemView, indent: usize, path: &std::path::Path) {
+    /// unchanged context dimmed, a modified row's old signature beneath,
+    /// and — when the row's stop is in `expanded` — the definitions of
+    /// the types it references, indented below.
+    fn item_row(
+        &mut self,
+        view: &ItemView,
+        indent: usize,
+        path: &std::path::Path,
+        expanded: &HashSet<usize>,
+        index: &TypeIndex,
+    ) {
         let pad = " ".repeat(indent);
         let sig = &view.item.signature;
         let jump_to = |line: SourceLine| {
@@ -493,20 +553,23 @@ impl LineBuilder {
                 line,
             })
         };
+        let expandable = view.item.refs.iter().any(|r| index.lookup(&r.0).is_some());
         match &view.status {
             ItemStatus::Added => {
                 self.stop(
                     Line::from(format!("{pad}+ {sig}")).green(),
                     jump_to(view.item.line),
+                    expandable,
                 );
             }
             ItemStatus::Removed => {
-                self.stop(Line::from(format!("{pad}- {sig}")).red(), None);
+                self.stop(Line::from(format!("{pad}- {sig}")).red(), None, expandable);
             }
             ItemStatus::Modified { before } => {
                 self.stop(
                     Line::from(format!("{pad}~ {sig}")).yellow(),
                     jump_to(view.item.line),
+                    expandable,
                 );
                 self.lines
                     .push(Line::from(format!("{pad}    was: {}", before.signature)).dim());
@@ -515,6 +578,37 @@ impl LineBuilder {
                 self.stop(
                     Line::from(format!("{pad}  {sig}")).dim(),
                     jump_to(view.item.line),
+                    expandable,
+                );
+            }
+        }
+        if expanded.contains(&(self.stops.len() - 1)) {
+            self.expansion(view, indent, index);
+        }
+    }
+
+    /// The definitions of the types `view` references, as non-stop
+    /// context lines: each resolved ref renders its signature, where it
+    /// lives, and its members.
+    fn expansion(&mut self, view: &ItemView, indent: usize, index: &TypeIndex) {
+        let pad = " ".repeat(indent + 4);
+        for r in &view.item.refs {
+            let Some(def) = index.lookup(&r.0) else {
+                continue;
+            };
+            let at = format!("  · {}:{}", def.item.id.path.display(), def.item.line);
+            self.lines.push(
+                Line::from(vec![
+                    Span::raw(format!("{pad}▸ {}", def.item.signature)),
+                    Span::raw(at).dim(),
+                ])
+                .cyan(),
+            );
+            for member in &def.members {
+                self.lines.push(
+                    Line::from(format!("{pad}      {}", member.item.signature))
+                        .cyan()
+                        .dim(),
                 );
             }
         }
@@ -527,7 +621,7 @@ impl LineBuilder {
 /// off as paragraphs, files separated by a blank line. Every item row is
 /// a stop (unchanged context included — it can still be expanded or
 /// jumped to); removed rows and deleted files have nowhere to go.
-fn render_lines(review: &[FileChange]) -> Rendered {
+fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIndex) -> Rendered {
     let mut b = LineBuilder::default();
     if review.is_empty() {
         b.lines.push(Line::from("No structural changes.").dim());
@@ -535,6 +629,7 @@ fn render_lines(review: &[FileChange]) -> Rendered {
             lines: b.lines,
             stops: b.stops,
             jumps: b.jumps,
+            expandable: b.expandable,
             headers: b.headers,
         };
     }
@@ -550,6 +645,7 @@ fn render_lines(review: &[FileChange]) -> Rendered {
                         .red()
                         .bold(),
                     None,
+                    false,
                 );
             }
             FileChangeKind::Changed(changeset) => {
@@ -559,6 +655,7 @@ fn render_lines(review: &[FileChange]) -> Rendered {
                         path: file.path.clone(),
                         line: SourceLine(1),
                     }),
+                    false,
                 );
                 let mut prev_was_composite = false;
                 for block in &changeset.blocks {
@@ -566,9 +663,9 @@ fn render_lines(review: &[FileChange]) -> Rendered {
                     if composite || prev_was_composite {
                         b.lines.push(Line::default());
                     }
-                    b.item_row(block, 2, &file.path);
+                    b.item_row(block, 2, &file.path, expanded, index);
                     for member in &block.members {
-                        b.item_row(member, 6, &file.path);
+                        b.item_row(member, 6, &file.path, expanded, index);
                     }
                     prev_was_composite = composite;
                 }
@@ -579,6 +676,7 @@ fn render_lines(review: &[FileChange]) -> Rendered {
         lines: b.lines,
         stops: b.stops,
         jumps: b.jumps,
+        expandable: b.expandable,
         headers: b.headers,
     }
 }
@@ -611,15 +709,18 @@ fn summarize(review: &[FileChange]) -> String {
 /// Runs the interactive view until the user quits. The effectful edge:
 /// sets up the terminal (raw mode + alternate screen via `ratatui::init`),
 /// pumps key events, and restores the terminal on the way out.
-pub(crate) fn run(review: &[FileChange], editor: &impl EditorLauncher) -> io::Result<()> {
+pub(crate) fn run(
+    review: &[FileChange],
+    index: TypeIndex,
+    editor: &impl EditorLauncher,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut App::new(review), editor);
+    let result = event_loop(&mut terminal, &mut App::new(review, index), editor);
     ratatui::restore();
     result
 }
 
-const HELP: &str =
-    " j/k move · {/} files · ^d/^u scroll · gg/G ends · / search · n/N matches · ↵ edit · q quit ";
+const HELP: &str = " j/k move · {/} files · / search · n/N matches · ⇥ expand · ↵ edit · q quit ";
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -668,6 +769,7 @@ fn event_loop(
                     match motion {
                         Motion::Quit => return Ok(()),
                         Motion::Open => notice = open_in_editor(terminal, app, editor)?,
+                        Motion::Expand => notice = app.toggle_expand(),
                         _ => app.apply(motion),
                     }
                 }
@@ -790,10 +892,20 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// `App` with an empty type index — expansion is exercised separately.
+    fn app(review: &[FileChange]) -> App {
+        App::new(review, TypeIndex::default())
+    }
+
+    /// `render_lines` with no expansions and an empty index.
+    fn render(review: &[FileChange]) -> Rendered {
+        render_lines(review, &HashSet::new(), &TypeIndex::default())
+    }
+
     /// Three added items in one file: 1 header + 3 change rows = 4 stops over
     /// 4 lines. Used by the cursor/scroll tests.
     fn three_items() -> App {
-        App::new(&[changed(
+        app(&[changed(
             "a.go",
             vec![
                 added(item("A", "func A()")),
@@ -809,12 +921,12 @@ mod tests {
         let changes = (0..n)
             .map(|i| added(item(&format!("F{i}"), &format!("func F{i}()"))))
             .collect();
-        App::new(&[changed("a.go", changes)])
+        app(&[changed("a.go", changes)])
     }
 
     #[test]
     fn empty_review_shows_placeholder() {
-        let rendered = render_lines(&[]);
+        let rendered = render(&[]);
         assert_eq!(rendered.lines.len(), 1);
         assert_eq!(text(&rendered.lines[0]), "No structural changes.");
         assert!(rendered.stops.is_empty());
@@ -822,7 +934,7 @@ mod tests {
 
     #[test]
     fn changed_file_renders_header_then_prefixed_changes() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
             vec![
                 added(item("A", "func A()")),
@@ -843,7 +955,7 @@ mod tests {
 
     #[test]
     fn stops_are_headers_and_change_rows_only() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
             vec![modified(item("B", "func B()"), item("B", "func B(x int)"))],
         )]);
@@ -853,7 +965,7 @@ mod tests {
 
     #[test]
     fn change_lines_are_colored_by_kind() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
             vec![added(item("A", "func A()")), removed(item("C", "func C()"))],
         )]);
@@ -863,7 +975,7 @@ mod tests {
 
     #[test]
     fn files_separated_by_blank_line() {
-        let rendered = render_lines(&[
+        let rendered = render(&[
             changed("a.go", vec![added(item("A", "func A()"))]),
             FileChange {
                 path: PathBuf::from("b.go"),
@@ -947,7 +1059,7 @@ mod tests {
 
     #[test]
     fn motions_are_noops_on_empty_review() {
-        let mut app = App::new(&[]);
+        let mut app = app(&[]);
         app.viewport_height = 10;
         app.cursor_down(1);
         app.goto_item(Some(2), true);
@@ -1137,13 +1249,66 @@ mod tests {
     }
 
     #[test]
+    fn input_decodes_tab_as_expand() {
+        let mut input = InputState::default();
+        assert_eq!(input.feed(KeyCode::Tab, false), Some(Motion::Expand));
+    }
+
+    /// An index defining `Client` with one field, and a review whose one
+    /// item references `Client`.
+    fn expandable_app() -> App {
+        let mut client = item("Client", "type Client struct");
+        client.id.kind = Kind::Struct;
+        let mut field = item("Client.timeout", "Client.timeout int");
+        field.id.kind = Kind::Field;
+        field.parent = Some("Client".into());
+        let mut client_surface = crate::surface::Surface::new();
+        client_surface.push(client);
+        client_surface.push(field);
+        let index = TypeIndex::build(&[client_surface]);
+
+        let mut connect = item("Connect", "func Connect() *Client");
+        connect.refs = vec![crate::item::TypeRef("Client".into())];
+        App::new(&[changed("a.go", vec![added(connect)])], index)
+    }
+
+    #[test]
+    fn tab_expands_referenced_types_inline_and_collapses_again() {
+        let mut app = expandable_app();
+        app.viewport_height = 20;
+        assert_eq!(app.lines.len(), 2); // header + row
+        assert_eq!(app.expandable, vec![false, true]);
+
+        app.cursor = 1;
+        assert_eq!(app.toggle_expand(), None);
+        let texts: Vec<String> = app.lines.iter().map(text).collect();
+        assert_eq!(texts[2], "      ▸ type Client struct  · f.go:1");
+        assert_eq!(texts[3], "            Client.timeout int");
+        // Expansion rows are not stops; the cursor's stop is unchanged.
+        assert_eq!(app.stops.len(), 2);
+        assert_eq!(app.cursor, 1);
+
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(app.lines.len(), 2);
+    }
+
+    #[test]
+    fn tab_on_an_unexpandable_row_notices() {
+        let mut app = expandable_app();
+        app.viewport_height = 20;
+        app.cursor = 0; // the file header
+        assert!(app.toggle_expand().is_some());
+        assert_eq!(app.lines.len(), 2);
+    }
+
+    #[test]
     fn stops_jump_to_head_side_lines() {
         let with_lines = |name: &str, sig: &str, line: u32| {
             let mut i = item(name, sig);
             i.line = crate::item::Line(line);
             i
         };
-        let app = App::new(&[
+        let app = app(&[
             changed(
                 "a.go",
                 vec![
@@ -1179,7 +1344,7 @@ mod tests {
 
     #[test]
     fn current_jump_follows_the_cursor() {
-        let mut app = App::new(&[changed("a.go", vec![added(item("A", "func A()"))])]);
+        let mut app = app(&[changed("a.go", vec![added(item("A", "func A()"))])]);
         app.viewport_height = 10;
         assert_eq!(app.current_jump().unwrap().line, crate::item::Line(1));
         app.cursor_down(1);
@@ -1201,7 +1366,7 @@ mod tests {
 
     /// Three files, one item each, so every stop carries a distinct name.
     fn three_files() -> App {
-        App::new(&[
+        app(&[
             changed("a.go", vec![added(item("Alpha", "func Alpha()"))]),
             changed("b.go", vec![added(item("Beta", "func Beta()"))]),
             changed("c.go", vec![added(item("Gamma", "func Gamma()"))]),

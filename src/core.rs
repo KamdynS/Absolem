@@ -91,6 +91,50 @@ pub(crate) enum FileChangeKind {
     Changed(ChangeSet),
 }
 
+/// A head-wide index of item definitions by name, for resolving
+/// `TypeRef`s the syntactic way: exact name match, with a fallback to
+/// the final segment of a qualified name (`pkg.Client` → `Client`).
+/// Members attach to their parent's entry across files, so an `impl` in
+/// another file lands on the type it extends. First definition wins on
+/// cross-file name collisions — an honest Tier 0 approximation, sharpened
+/// when a semantic tier lands.
+#[derive(Debug, Default)]
+pub(crate) struct TypeIndex {
+    by_name: HashMap<String, ItemView>,
+}
+
+impl TypeIndex {
+    pub(crate) fn build(surfaces: &[Surface]) -> Self {
+        let mut by_name: HashMap<String, ItemView> = HashMap::new();
+        for surface in surfaces {
+            for item in surface.iter().filter(|i| i.parent.is_none()) {
+                by_name
+                    .entry(item.id.name.clone())
+                    .or_insert_with(|| ItemView::leaf(ItemStatus::Unchanged, item.clone()));
+            }
+        }
+        for surface in surfaces {
+            for item in surface.iter() {
+                if let Some(parent) = &item.parent
+                    && let Some(block) = by_name.get_mut(parent)
+                {
+                    block
+                        .members
+                        .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
+                }
+            }
+        }
+        Self { by_name }
+    }
+
+    pub(crate) fn lookup(&self, name: &str) -> Option<&ItemView> {
+        self.by_name.get(name).or_else(|| {
+            let last = name.rsplit(['.', ':']).next()?;
+            (last != name).then(|| self.by_name.get(last))?
+        })
+    }
+}
+
 pub(crate) fn diff(base: &Surface, head: &Surface) -> ChangeSet {
     let base_by_id = base.by_id();
     let head_by_id = head.by_id();
@@ -360,6 +404,40 @@ mod tests {
         moved.line = Line(40);
         let head = surface(vec![moved]);
         assert!(diff(&base, &head).is_empty());
+    }
+
+    #[test]
+    fn type_index_resolves_names_and_attaches_cross_file_members() {
+        let mut client = item("Client", Kind::Struct, "type Client struct");
+        client.id.path = PathBuf::from("client.go");
+        let mut field = member(
+            "Client",
+            "Client.timeout",
+            Kind::Field,
+            "Client.timeout int",
+        );
+        field.id.path = PathBuf::from("client.go");
+        // A method on Client declared in a different file.
+        let mut method = member(
+            "Client",
+            "Client.Close",
+            Kind::Method,
+            "func (c *Client) Close() error",
+        );
+        method.id.path = PathBuf::from("client_ext.go");
+
+        let index = TypeIndex::build(&[surface(vec![client, field]), surface(vec![method])]);
+        let block = index.lookup("Client").unwrap();
+        assert_eq!(block.item.id.name, "Client");
+        let members: Vec<_> = block
+            .members
+            .iter()
+            .map(|m| m.item.id.name.as_str())
+            .collect();
+        assert_eq!(members, vec!["Client.timeout", "Client.Close"]);
+        // Qualified names fall back to their final segment.
+        assert!(index.lookup("pkg.Client").is_some());
+        assert!(index.lookup("Missing").is_none());
     }
 
     #[test]

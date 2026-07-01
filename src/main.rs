@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use crate::core::{FileChange, FileChangeKind, diff};
+use crate::core::{FileChange, FileChangeKind, TypeIndex, diff};
 use crate::git::{ChangeStatus, ChangedFile, DiffMode, GitRepo, RealGit, RefRange};
 use crate::item::Line;
 use crate::producer::{Producer, ProducerError, Registry};
@@ -160,7 +160,8 @@ fn main() -> Result<()> {
             markdown::render_markdown(&mut out, &review)?;
         }
         OutputMode::Interactive => {
-            tui::run(&review, &RealEditor::from_env()).context("interactive view failed")?;
+            let index = build_type_index(&git, &mut registry, &range.head);
+            tui::run(&review, index, &RealEditor::from_env()).context("interactive view failed")?;
         }
     }
 
@@ -203,6 +204,29 @@ fn build_review(
         }
     }
     Ok(review)
+}
+
+/// Extracts every supported file at `head` into the index the TUI
+/// resolves type expansions against. Best-effort by design: a file that
+/// fails to read or parse is skipped, never fatal — the index only
+/// powers an optional affordance, not the review itself.
+fn build_type_index(git: &impl GitRepo, registry: &mut Registry, head: &str) -> TypeIndex {
+    let Ok(files) = git.ls_files(head) else {
+        return TypeIndex::default();
+    };
+    let supported: Vec<_> = files.into_iter().filter(|p| registry.supports(p)).collect();
+    let mut surfaces = Vec::new();
+    for path in &supported {
+        let Some(producer) = registry.for_path(path) else {
+            continue;
+        };
+        if let Ok(source) = git.read_at(head, path)
+            && let Ok(surface) = producer.extract(path, &source)
+        {
+            surfaces.push(surface);
+        }
+    }
+    TypeIndex::build(&surfaces)
 }
 
 fn surface_at(
@@ -313,6 +337,10 @@ mod tests {
                 .get(&key)
                 .cloned()
                 .ok_or_else(|| GitError::UnexpectedOutput(format!("no content for {key}")))
+        }
+
+        fn ls_files(&self, _rev: &str) -> Result<Vec<PathBuf>, GitError> {
+            Ok(self.files.iter().map(|f| f.path.clone()).collect())
         }
     }
 

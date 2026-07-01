@@ -70,6 +70,10 @@ pub(crate) trait GitRepo {
 
     /// Read the contents of `path` at revision `rev`.
     fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError>;
+
+    /// Every file in the tree at `rev`, repo-relative. Feeds the
+    /// head-wide type index that resolves `TypeRef`s by name.
+    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError>;
 }
 
 pub(crate) struct RealGit {
@@ -122,6 +126,15 @@ impl GitRepo for RealGit {
     fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError> {
         let spec = format!("{}:{}", rev, path.display());
         self.run_checked(&["show", &spec])
+    }
+
+    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError> {
+        let raw = self.run_checked(&["ls-tree", "-r", "--name-only", "-z", rev])?;
+        Ok(raw
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect())
     }
 }
 
