@@ -119,13 +119,25 @@ Roughly, in this order — the *order* is a current best guess, not law. What
 matters: the smallest end-to-end thing that runs on a real diff, then grow
 from real usage.
 
-- A syntactic TUI for Go: tree-sitter-go producer, core diff, TUI frontend,
-  CLI wiring. No resolution, no navigation. Run it on a real review.
-- Go goes semantic via gopls: resolved `TypeRef` edges, jump-to-definition
-  from the TUI.
-- A second frontend — likely the Neovim plugin — consuming the same IR over
-  JSON.
-- A second language (Tier 0) and the CI pipeline comment.
+Landed so far:
+
+- The syntactic TUI, for Go **and** Rust (second language arrived early):
+  tree-sitter producers behind a registry, member-level extraction
+  (fields, variants, interface/trait methods), core diff, CLI wiring
+  with arbitrary `base..head` ranges.
+- Three more frontends over the same ChangeSet: plain text, JSON
+  (schema-versioned — the seam the Neovim plugin will consume), and the
+  markdown CI pipeline comment.
+- A first slice of navigation: the TUI jumps to an item in `$EDITOR` at
+  its head-side line. Editor launch is a capability; no language server
+  yet.
+
+Next:
+
+- Go goes semantic via gopls: resolved `TypeRef` edges, real
+  jump-to-definition / find-references from the TUI.
+- The Neovim plugin consuming the JSON IR.
+- Wire the markdown frontend into an actual CI pipeline.
 
 If something forces the producer / core / frontend boundary to leak, or
 forces a second shipped binary, treat that as a signal to stop and rethink —
