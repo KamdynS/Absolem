@@ -23,25 +23,32 @@ use crate::producer::{Producer, ProducerError, Registry};
 use crate::surface::Surface;
 use crate::tui::EditorLauncher;
 
-/// The real `$EDITOR`, invoked as `editor +LINE PATH` — the convention
-/// the vi lineage, nano, and emacs all accept. Constructed only here,
-/// at the composition root.
+/// The user's editor, invoked as `editor +LINE PATH` — the convention
+/// the vi lineage (nvim included), nano, and emacs all accept. Strictly
+/// `$VISUAL` / `$EDITOR`: absolem never guesses an editor the user
+/// didn't choose. Constructed only here, at the composition root.
 struct RealEditor {
-    program: String,
+    program: Option<String>,
 }
 
 impl RealEditor {
     fn from_env() -> Self {
         let program = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".to_owned());
+            .ok()
+            .filter(|p| !p.trim().is_empty());
         Self { program }
     }
 }
 
 impl EditorLauncher for RealEditor {
     fn open(&self, path: &Path, line: Line) -> std::io::Result<()> {
-        let status = std::process::Command::new(&self.program)
+        let Some(program) = &self.program else {
+            return Err(std::io::Error::other(
+                "$VISUAL / $EDITOR is not set — set one to jump into your editor",
+            ));
+        };
+        let status = std::process::Command::new(program)
             .arg(format!("+{line}"))
             .arg(path)
             .status()?;
@@ -49,8 +56,7 @@ impl EditorLauncher for RealEditor {
             Ok(())
         } else {
             Err(std::io::Error::other(format!(
-                "{} exited with {status}",
-                self.program
+                "{program} exited with {status}"
             )))
         }
     }
