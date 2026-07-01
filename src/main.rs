@@ -4,6 +4,7 @@ mod core;
 mod git;
 mod item;
 mod json;
+mod markdown;
 mod producer;
 mod render;
 mod surface;
@@ -42,6 +43,11 @@ struct Cli {
     /// like editor plugins.
     #[arg(long, group = "output")]
     json: bool,
+
+    /// Emit the review as forge-flavored markdown, for a CI pipeline
+    /// comment.
+    #[arg(long, group = "output")]
+    markdown: bool,
 }
 
 /// Which frontend gets the review. Decided once, at the edge, from the
@@ -51,12 +57,15 @@ enum OutputMode {
     Interactive,
     Plain,
     Json,
+    Markdown,
 }
 
 impl Cli {
     fn output_mode(&self) -> OutputMode {
         if self.json {
             OutputMode::Json
+        } else if self.markdown {
+            OutputMode::Markdown
         } else if self.plain || !std::io::stdout().is_terminal() {
             OutputMode::Plain
         } else {
@@ -103,6 +112,11 @@ fn main() -> Result<()> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             json::render_json(&mut out, &review)?;
+        }
+        OutputMode::Markdown => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            markdown::render_markdown(&mut out, &review)?;
         }
         OutputMode::Interactive => tui::run(&review).context("interactive view failed")?,
     }
