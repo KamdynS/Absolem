@@ -131,6 +131,12 @@ Landed so far:
 - A first slice of navigation: the TUI jumps to an item in `$EDITOR` at
   its head-side line. Editor launch is a capability; no language server
   yet.
+- Displayed-tier `TypeRef`s: producers collect the type names each
+  signature mentions; a head-wide index resolves them by name, and the
+  TUI expands a row's referenced types inline. Semantic tiers upgrade
+  the same edges to real resolution.
+- Member-level grouping with context: a changed composite renders whole,
+  unchanged members dimmed, so the diff reads like the type it changed.
 
 Next:
 

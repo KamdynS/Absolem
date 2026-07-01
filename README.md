@@ -23,16 +23,24 @@ A bare base and `...` compare against the merge base — what GitHub and
 GitLab show on a PR. `..` diffs the two trees directly.
 
 Output marks each item `+` added, `-` removed, `~` modified (with the
-old signature beneath). Files whose API shape did not move are omitted;
-a body-only edit renders nothing, by design.
+old signature beneath). A changed composite renders **whole** — every
+field, variant, or method listed, unchanged members as dimmed context,
+the changes in place. Files whose API shape did not move are omitted; a
+body-only edit renders nothing, by design.
 
 ### The TUI
 
 Vim-style: `j`/`k` move (counts work: `5j`), `{`/`}` hop files,
 `Ctrl-d`/`Ctrl-u` scroll, `gg`/`G` ends, `H`/`M`/`L` and `zt`/`zz`/`zb`
-position, `/` search with `n`/`N`, `Enter` opens the item in
-`$VISUAL`/`$EDITOR` at its line, `q` quits. Colors are ANSI palette
-entries, so the view takes on your terminal's theme.
+position, `/` search with `n`/`N`, `q` quits. Colors are ANSI palette
+entries, so the view takes on your terminal's theme; modified rows mark
+exactly the tokens that changed.
+
+`Tab` expands the types the current row references — the definition and
+members of a signature's parameter or return types unfold inline,
+resolved by name against the whole tree at head. `Enter` opens the item
+at its line in `$VISUAL`/`$EDITOR` (strictly those; if neither is set,
+absolem tells you rather than guessing an editor).
 
 ## Languages
 
