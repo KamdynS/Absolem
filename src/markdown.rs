@@ -5,11 +5,12 @@
 //! Each file is a bold heading over a diff-language code fence, so
 //! GitHub/GitLab color added lines green and removed lines red. A
 //! modified item renders as a remove/add pair — the diff idiom readers
-//! already know.
+//! already know — and unchanged context rows carry the leading space of
+//! a diff context line. Members are indented under their block header.
 
 use std::io::{self, Write};
 
-use crate::core::{Change, ChangeSet, FileChange, FileChangeKind};
+use crate::core::{ChangeSet, FileChange, FileChangeKind, ItemStatus, ItemView};
 
 pub(crate) fn render_markdown(out: &mut impl Write, review: &[FileChange]) -> io::Result<()> {
     writeln!(out, "### absolem — shape of the change")?;
@@ -36,17 +37,33 @@ pub(crate) fn render_markdown(out: &mut impl Write, review: &[FileChange]) -> io
 
 fn render_fence(out: &mut impl Write, changeset: &ChangeSet) -> io::Result<()> {
     writeln!(out, "```diff")?;
-    for change in &changeset.changes {
-        match change {
-            Change::Added(item) => writeln!(out, "+ {}", item.signature)?,
-            Change::Removed(item) => writeln!(out, "- {}", item.signature)?,
-            Change::Modified { before, after } => {
-                writeln!(out, "- {}", before.signature)?;
-                writeln!(out, "+ {}", after.signature)?;
-            }
+    let mut prev_was_composite = false;
+    for block in &changeset.blocks {
+        let composite = !block.members.is_empty();
+        if composite || prev_was_composite {
+            writeln!(out)?;
         }
+        render_row(out, block, "")?;
+        for member in &block.members {
+            render_row(out, member, "  ")?;
+        }
+        prev_was_composite = composite;
     }
     writeln!(out, "```")
+}
+
+/// One row inside the fence: the diff marker column (`+`, `-`, or the
+/// context space), a space, the member indent, and the signature.
+fn render_row(out: &mut impl Write, view: &ItemView, indent: &str) -> io::Result<()> {
+    match &view.status {
+        ItemStatus::Added => writeln!(out, "+ {indent}{}", view.item.signature),
+        ItemStatus::Removed => writeln!(out, "- {indent}{}", view.item.signature),
+        ItemStatus::Modified { before } => {
+            writeln!(out, "- {indent}{}", before.signature)?;
+            writeln!(out, "+ {indent}{}", view.item.signature)
+        }
+        ItemStatus::Unchanged => writeln!(out, "  {indent}{}", view.item.signature),
+    }
 }
 
 #[cfg(test)]
@@ -71,10 +88,18 @@ mod tests {
         }
     }
 
-    fn changed(path: &str, changes: Vec<Change>) -> FileChange {
+    fn leaf(status: ItemStatus, name: &str, sig: &str) -> ItemView {
+        ItemView {
+            status,
+            item: item(name, sig),
+            members: Vec::new(),
+        }
+    }
+
+    fn changed(path: &str, blocks: Vec<ItemView>) -> FileChange {
         FileChange {
             path: PathBuf::from(path),
-            kind: FileChangeKind::Changed(ChangeSet { changes }),
+            kind: FileChangeKind::Changed(ChangeSet { blocks }),
         }
     }
 
@@ -93,16 +118,19 @@ mod tests {
     }
 
     #[test]
-    fn changed_file_renders_a_diff_fence() {
+    fn leaf_changes_render_as_diff_lines() {
         let review = vec![changed(
             "a.go",
             vec![
-                Change::Added(item("A", "func A()")),
-                Change::Modified {
-                    before: item("B", "func B()"),
-                    after: item("B", "func B(x int)"),
-                },
-                Change::Removed(item("C", "func C()")),
+                leaf(ItemStatus::Added, "A", "func A()"),
+                leaf(
+                    ItemStatus::Modified {
+                        before: item("B", "func B()"),
+                    },
+                    "B",
+                    "func B(x int)",
+                ),
+                leaf(ItemStatus::Removed, "C", "func C()"),
             ],
         )];
         assert_eq!(
@@ -123,9 +151,41 @@ mod tests {
     }
 
     #[test]
+    fn composite_renders_with_context_rows() {
+        let block = ItemView {
+            status: ItemStatus::Unchanged,
+            item: item("Kind", "pub enum Kind"),
+            members: vec![
+                leaf(ItemStatus::Unchanged, "Kind::Function", "Kind::Function"),
+                leaf(ItemStatus::Added, "Kind::Field", "Kind::Field"),
+            ],
+        };
+        let review = vec![changed(
+            "item.rs",
+            vec![leaf(ItemStatus::Added, "f", "fn f()"), block],
+        )];
+        assert_eq!(
+            render(&review),
+            concat!(
+                "### absolem — shape of the change\n",
+                "\n",
+                "**`item.rs`**\n",
+                "\n",
+                "```diff\n",
+                "+ fn f()\n",
+                "\n",
+                "  pub enum Kind\n",
+                "    Kind::Function\n",
+                "+   Kind::Field\n",
+                "```\n",
+            )
+        );
+    }
+
+    #[test]
     fn deleted_file_renders_without_a_fence() {
         let review = vec![
-            changed("a.go", vec![Change::Added(item("A", "func A()"))]),
+            changed("a.go", vec![leaf(ItemStatus::Added, "A", "func A()")]),
             FileChange {
                 path: PathBuf::from("gone.go"),
                 kind: FileChangeKind::Deleted,

@@ -26,7 +26,7 @@ use ratatui::style::{Modifier, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::core::{Change, FileChange, FileChangeKind};
+use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView};
 use crate::item::Line as SourceLine;
 
 /// The authority to open the user's editor at a location. A capability
@@ -462,80 +462,124 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Accumulates the rendered lines and, in parallel, the cursor stops
+/// with their jump targets. Blank separators and `was:` continuation
+/// rows are lines but not stops.
+#[derive(Default)]
+struct LineBuilder {
+    lines: Vec<Line<'static>>,
+    stops: Vec<u16>,
+    jumps: Vec<Option<JumpTarget>>,
+    headers: Vec<usize>,
+}
+
+impl LineBuilder {
+    /// Pushes a line the cursor can land on.
+    fn stop(&mut self, line: Line<'static>, jump: Option<JumpTarget>) {
+        self.stops
+            .push(u16::try_from(self.lines.len()).unwrap_or(u16::MAX));
+        self.jumps.push(jump);
+        self.lines.push(line);
+    }
+
+    /// One item row at `indent`: status marker and color by status,
+    /// unchanged context dimmed, a modified row's old signature beneath.
+    fn item_row(&mut self, view: &ItemView, indent: usize, path: &std::path::Path) {
+        let pad = " ".repeat(indent);
+        let sig = &view.item.signature;
+        let jump_to = |line: SourceLine| {
+            Some(JumpTarget {
+                path: path.to_path_buf(),
+                line,
+            })
+        };
+        match &view.status {
+            ItemStatus::Added => {
+                self.stop(
+                    Line::from(format!("{pad}+ {sig}")).green(),
+                    jump_to(view.item.line),
+                );
+            }
+            ItemStatus::Removed => {
+                self.stop(Line::from(format!("{pad}- {sig}")).red(), None);
+            }
+            ItemStatus::Modified { before } => {
+                self.stop(
+                    Line::from(format!("{pad}~ {sig}")).yellow(),
+                    jump_to(view.item.line),
+                );
+                self.lines
+                    .push(Line::from(format!("{pad}    was: {}", before.signature)).dim());
+            }
+            ItemStatus::Unchanged => {
+                self.stop(
+                    Line::from(format!("{pad}  {sig}")).dim(),
+                    jump_to(view.item.line),
+                );
+            }
+        }
+    }
+}
+
 /// Turns a review into the styled lines the pane scrolls over, the set of
-/// cursor stops, and each stop's jump target. Files are separated by a
-/// blank line, mirroring the plain-text frontend. Stops are the file
-/// headers and the change rows; the blank separators and the `was:`
-/// continuation lines are skipped. File headers jump to line 1; added and
-/// modified rows jump to the item's head-side line; removed rows and
-/// deleted files have nowhere to go.
+/// cursor stops, and each stop's jump target. Layout mirrors the plain
+/// frontend: members indented under their block header, composites set
+/// off as paragraphs, files separated by a blank line. Every item row is
+/// a stop (unchanged context included — it can still be expanded or
+/// jumped to); removed rows and deleted files have nowhere to go.
 fn render_lines(review: &[FileChange]) -> Rendered {
-    let mut lines = Vec::new();
-    let mut stops = Vec::new();
-    let mut jumps = Vec::new();
-    let mut headers = Vec::new();
+    let mut b = LineBuilder::default();
     if review.is_empty() {
-        lines.push(Line::from("No structural changes.").dim());
+        b.lines.push(Line::from("No structural changes.").dim());
         return Rendered {
-            lines,
-            stops,
-            jumps,
-            headers,
+            lines: b.lines,
+            stops: b.stops,
+            jumps: b.jumps,
+            headers: b.headers,
         };
     }
     for (i, file) in review.iter().enumerate() {
         if i > 0 {
-            lines.push(Line::default());
+            b.lines.push(Line::default());
         }
-        let stop = |lines: &[Line<'static>],
-                    stops: &mut Vec<u16>,
-                    jumps: &mut Vec<Option<JumpTarget>>,
-                    target: Option<SourceLine>| {
-            stops.push(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-            jumps.push(target.map(|line| JumpTarget {
-                path: file.path.clone(),
-                line,
-            }));
-        };
-        headers.push(stops.len());
+        b.headers.push(b.stops.len());
         match &file.kind {
             FileChangeKind::Deleted => {
-                stop(&lines, &mut stops, &mut jumps, None);
-                lines.push(
+                b.stop(
                     Line::from(format!("DELETED {}", file.path.display()))
                         .red()
                         .bold(),
+                    None,
                 );
             }
             FileChangeKind::Changed(changeset) => {
-                stop(&lines, &mut stops, &mut jumps, Some(SourceLine(1)));
-                lines.push(Line::from(file.path.display().to_string()).bold());
-                for change in &changeset.changes {
-                    match change {
-                        Change::Added(item) => {
-                            stop(&lines, &mut stops, &mut jumps, Some(item.line));
-                            lines.push(Line::from(format!("  + {}", item.signature)).green());
-                        }
-                        Change::Removed(item) => {
-                            stop(&lines, &mut stops, &mut jumps, None);
-                            lines.push(Line::from(format!("  - {}", item.signature)).red());
-                        }
-                        Change::Modified { before, after } => {
-                            stop(&lines, &mut stops, &mut jumps, Some(after.line));
-                            lines.push(Line::from(format!("  ~ {}", after.signature)).yellow());
-                            lines
-                                .push(Line::from(format!("      was: {}", before.signature)).dim());
-                        }
+                b.stop(
+                    Line::from(file.path.display().to_string()).bold(),
+                    Some(JumpTarget {
+                        path: file.path.clone(),
+                        line: SourceLine(1),
+                    }),
+                );
+                let mut prev_was_composite = false;
+                for block in &changeset.blocks {
+                    let composite = !block.members.is_empty();
+                    if composite || prev_was_composite {
+                        b.lines.push(Line::default());
                     }
+                    b.item_row(block, 2, &file.path);
+                    for member in &block.members {
+                        b.item_row(member, 6, &file.path);
+                    }
+                    prev_was_composite = composite;
                 }
             }
         }
     }
     Rendered {
-        lines,
-        stops,
-        jumps,
-        headers,
+        lines: b.lines,
+        stops: b.stops,
+        jumps: b.jumps,
+        headers: b.headers,
     }
 }
 
@@ -543,13 +587,18 @@ fn render_lines(review: &[FileChange]) -> Rendered {
 /// counted among the files but not the change tallies.
 fn summarize(review: &[FileChange]) -> String {
     let (mut added, mut modified, mut removed) = (0usize, 0usize, 0usize);
+    let mut tally = |view: &ItemView| match view.status {
+        ItemStatus::Added => added += 1,
+        ItemStatus::Modified { .. } => modified += 1,
+        ItemStatus::Removed => removed += 1,
+        ItemStatus::Unchanged => {}
+    };
     for file in review {
         if let FileChangeKind::Changed(changeset) = &file.kind {
-            for change in &changeset.changes {
-                match change {
-                    Change::Added(_) => added += 1,
-                    Change::Modified { .. } => modified += 1,
-                    Change::Removed(_) => removed += 1,
+            for block in &changeset.blocks {
+                tally(block);
+                for member in &block.members {
+                    tally(member);
                 }
             }
         }
@@ -710,10 +759,30 @@ mod tests {
         }
     }
 
-    fn changed(path: &str, changes: Vec<Change>) -> FileChange {
+    fn leaf(status: ItemStatus, item: Item) -> ItemView {
+        ItemView {
+            status,
+            item,
+            members: Vec::new(),
+        }
+    }
+
+    fn added(item: Item) -> ItemView {
+        leaf(ItemStatus::Added, item)
+    }
+
+    fn removed(item: Item) -> ItemView {
+        leaf(ItemStatus::Removed, item)
+    }
+
+    fn modified(before: Item, after: Item) -> ItemView {
+        leaf(ItemStatus::Modified { before }, after)
+    }
+
+    fn changed(path: &str, blocks: Vec<ItemView>) -> FileChange {
         FileChange {
             path: PathBuf::from(path),
-            kind: FileChangeKind::Changed(ChangeSet { changes }),
+            kind: FileChangeKind::Changed(ChangeSet { blocks }),
         }
     }
 
@@ -727,9 +796,9 @@ mod tests {
         App::new(&[changed(
             "a.go",
             vec![
-                Change::Added(item("A", "func A()")),
-                Change::Added(item("B", "func B()")),
-                Change::Added(item("C", "func C()")),
+                added(item("A", "func A()")),
+                added(item("B", "func B()")),
+                added(item("C", "func C()")),
             ],
         )])
     }
@@ -738,7 +807,7 @@ mod tests {
     /// over n+1 lines. Used by the viewport-positioning tests.
     fn many_items(n: usize) -> App {
         let changes = (0..n)
-            .map(|i| Change::Added(item(&format!("F{i}"), &format!("func F{i}()"))))
+            .map(|i| added(item(&format!("F{i}"), &format!("func F{i}()"))))
             .collect();
         App::new(&[changed("a.go", changes)])
     }
@@ -756,11 +825,8 @@ mod tests {
         let rendered = render_lines(&[changed(
             "a.go",
             vec![
-                Change::Added(item("A", "func A()")),
-                Change::Modified {
-                    before: item("B", "func B()"),
-                    after: item("B", "func B(x int)"),
-                },
+                added(item("A", "func A()")),
+                modified(item("B", "func B()"), item("B", "func B(x int)")),
             ],
         )]);
         let lines: Vec<String> = rendered.lines.iter().map(text).collect();
@@ -779,10 +845,7 @@ mod tests {
     fn stops_are_headers_and_change_rows_only() {
         let rendered = render_lines(&[changed(
             "a.go",
-            vec![Change::Modified {
-                before: item("B", "func B()"),
-                after: item("B", "func B(x int)"),
-            }],
+            vec![modified(item("B", "func B()"), item("B", "func B(x int)"))],
         )]);
         // Lines: 0 header, 1 "~", 2 "was:". The continuation row is not a stop.
         assert_eq!(rendered.stops, vec![0, 1]);
@@ -792,10 +855,7 @@ mod tests {
     fn change_lines_are_colored_by_kind() {
         let rendered = render_lines(&[changed(
             "a.go",
-            vec![
-                Change::Added(item("A", "func A()")),
-                Change::Removed(item("C", "func C()")),
-            ],
+            vec![added(item("A", "func A()")), removed(item("C", "func C()"))],
         )]);
         assert_eq!(rendered.lines[1].style.fg, Some(Color::Green));
         assert_eq!(rendered.lines[2].style.fg, Some(Color::Red));
@@ -804,7 +864,7 @@ mod tests {
     #[test]
     fn files_separated_by_blank_line() {
         let rendered = render_lines(&[
-            changed("a.go", vec![Change::Added(item("A", "func A()"))]),
+            changed("a.go", vec![added(item("A", "func A()"))]),
             FileChange {
                 path: PathBuf::from("b.go"),
                 kind: FileChangeKind::Deleted,
@@ -1056,12 +1116,9 @@ mod tests {
             changed(
                 "a.go",
                 vec![
-                    Change::Added(item("A", "func A()")),
-                    Change::Modified {
-                        before: item("B", "func B()"),
-                        after: item("B", "func B(x int)"),
-                    },
-                    Change::Removed(item("C", "func C()")),
+                    added(item("A", "func A()")),
+                    modified(item("B", "func B()"), item("B", "func B(x int)")),
+                    removed(item("C", "func C()")),
                 ],
             ),
             FileChange {
@@ -1090,12 +1147,12 @@ mod tests {
             changed(
                 "a.go",
                 vec![
-                    Change::Added(with_lines("A", "func A()", 10)),
-                    Change::Modified {
-                        before: with_lines("B", "func B()", 12),
-                        after: with_lines("B", "func B(x int)", 20),
-                    },
-                    Change::Removed(with_lines("C", "func C()", 30)),
+                    added(with_lines("A", "func A()", 10)),
+                    modified(
+                        with_lines("B", "func B()", 12),
+                        with_lines("B", "func B(x int)", 20),
+                    ),
+                    removed(with_lines("C", "func C()", 30)),
                 ],
             ),
             FileChange {
@@ -1122,7 +1179,7 @@ mod tests {
 
     #[test]
     fn current_jump_follows_the_cursor() {
-        let mut app = App::new(&[changed("a.go", vec![Change::Added(item("A", "func A()"))])]);
+        let mut app = App::new(&[changed("a.go", vec![added(item("A", "func A()"))])]);
         app.viewport_height = 10;
         assert_eq!(app.current_jump().unwrap().line, crate::item::Line(1));
         app.cursor_down(1);
@@ -1145,9 +1202,9 @@ mod tests {
     /// Three files, one item each, so every stop carries a distinct name.
     fn three_files() -> App {
         App::new(&[
-            changed("a.go", vec![Change::Added(item("Alpha", "func Alpha()"))]),
-            changed("b.go", vec![Change::Added(item("Beta", "func Beta()"))]),
-            changed("c.go", vec![Change::Added(item("Gamma", "func Gamma()"))]),
+            changed("a.go", vec![added(item("Alpha", "func Alpha()"))]),
+            changed("b.go", vec![added(item("Beta", "func Beta()"))]),
+            changed("c.go", vec![added(item("Gamma", "func Gamma()"))]),
         ])
     }
 
