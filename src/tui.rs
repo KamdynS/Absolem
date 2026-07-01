@@ -12,8 +12,10 @@
 //!
 //! Same convention as the plain-text frontend (`+`/`-`/`~`), here carried by
 //! color: added green, removed red, modified yellow with the old signature
-//! dimmed beneath. The cursor's row is shown reversed. No resolution, no
-//! navigation across refs — just shape.
+//! dimmed beneath. The cursor's row is shown reversed. All colors are
+//! ANSI palette entries, never RGB, so the view absorbs the terminal
+//! emulator's theme instead of fighting it. No resolution and no
+//! navigation across refs — just shape, plus a jump out to `$EDITOR`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,8 @@ struct Rendered {
     stops: Vec<u16>,
     /// Parallel to `stops`: where each stop jumps when opened.
     jumps: Vec<Option<JumpTarget>>,
+    /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
+    headers: Vec<usize>,
 }
 
 /// A decoded normal-mode command. `usize` payloads are repeat counts; the
@@ -79,6 +83,9 @@ enum Motion {
     ViewBottom,
     NextMatch,
     PrevMatch,
+    /// `{` / `}` — move the cursor to the previous / next file header.
+    PrevFile(usize),
+    NextFile(usize),
     /// `Enter` — open the cursor's item in the user's editor.
     Open,
     Quit,
@@ -178,6 +185,8 @@ impl InputState {
             (false, KeyCode::Char('L')) => Motion::CursorLow,
             (false, KeyCode::Char('n')) => Motion::NextMatch,
             (false, KeyCode::Char('N')) => Motion::PrevMatch,
+            (false, KeyCode::Char('{')) => Motion::PrevFile(times),
+            (false, KeyCode::Char('}')) => Motion::NextFile(times),
             (false, KeyCode::Enter) => Motion::Open,
             _ => return None,
         };
@@ -194,8 +203,12 @@ struct App {
     stops: Vec<u16>,
     /// Parallel to `stops`: where each stop jumps when opened.
     jumps: Vec<Option<JumpTarget>>,
+    /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
+    headers: Vec<usize>,
     /// Stop indices whose row matched the last committed search.
     matches: Vec<usize>,
+    /// The title-bar summary: file and change counts.
+    summary: String,
     cursor: usize,
     scroll: u16,
     viewport_height: u16,
@@ -207,12 +220,15 @@ impl App {
             lines,
             stops,
             jumps,
+            headers,
         } = render_lines(review);
         Self {
             lines,
             stops,
             jumps,
+            headers,
             matches: Vec::new(),
+            summary: summarize(review),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
@@ -262,6 +278,8 @@ impl App {
             Motion::ViewBottom => self.scroll_cursor_to(ViewSpot::Bottom),
             Motion::NextMatch => self.next_match(),
             Motion::PrevMatch => self.prev_match(),
+            Motion::PrevFile(n) => self.prev_file(n),
+            Motion::NextFile(n) => self.next_file(n),
             // Open and Quit act on the world outside the pane; the event
             // loop handles them.
             Motion::Open | Motion::Quit => {}
@@ -378,6 +396,37 @@ impl App {
         self.scroll = line.saturating_sub(offset).min(self.max_scroll());
     }
 
+    /// `{`: the `n`-th file header strictly before the cursor, saturating
+    /// at the first.
+    fn prev_file(&mut self, n: usize) {
+        let before = self.headers.iter().filter(|&&h| h < self.cursor).count();
+        let Some(&target) = before
+            .checked_sub(n)
+            .or(if before > 0 { Some(0) } else { None })
+            .and_then(|i| self.headers.get(i))
+        else {
+            return;
+        };
+        self.cursor = target;
+        self.scroll_to_cursor();
+    }
+
+    /// `}`: the `n`-th file header strictly after the cursor, saturating
+    /// at the last.
+    fn next_file(&mut self, n: usize) {
+        let mut after = self.headers.iter().filter(|&&h| h > self.cursor);
+        let Some(&target) = after
+            .nth(n.saturating_sub(1))
+            .or_else(|| self.headers.last())
+        else {
+            return;
+        };
+        if target > self.cursor {
+            self.cursor = target;
+            self.scroll_to_cursor();
+        }
+    }
+
     fn next_match(&mut self) {
         if self.matches.is_empty() {
             return;
@@ -424,12 +473,14 @@ fn render_lines(review: &[FileChange]) -> Rendered {
     let mut lines = Vec::new();
     let mut stops = Vec::new();
     let mut jumps = Vec::new();
+    let mut headers = Vec::new();
     if review.is_empty() {
         lines.push(Line::from("No structural changes.").dim());
         return Rendered {
             lines,
             stops,
             jumps,
+            headers,
         };
     }
     for (i, file) in review.iter().enumerate() {
@@ -446,6 +497,7 @@ fn render_lines(review: &[FileChange]) -> Rendered {
                 line,
             }));
         };
+        headers.push(stops.len());
         match &file.kind {
             FileChangeKind::Deleted => {
                 stop(&lines, &mut stops, &mut jumps, None);
@@ -483,7 +535,28 @@ fn render_lines(review: &[FileChange]) -> Rendered {
         lines,
         stops,
         jumps,
+        headers,
     }
+}
+
+/// The title-bar summary: `5 files · +12 ~3 -4`, with deleted files
+/// counted among the files but not the change tallies.
+fn summarize(review: &[FileChange]) -> String {
+    let (mut added, mut modified, mut removed) = (0usize, 0usize, 0usize);
+    for file in review {
+        if let FileChangeKind::Changed(changeset) = &file.kind {
+            for change in &changeset.changes {
+                match change {
+                    Change::Added(_) => added += 1,
+                    Change::Modified { .. } => modified += 1,
+                    Change::Removed(_) => removed += 1,
+                }
+            }
+        }
+    }
+    let files = review.len();
+    let plural = if files == 1 { "file" } else { "files" };
+    format!("{files} {plural} · +{added} ~{modified} -{removed}")
 }
 
 /// Runs the interactive view until the user quits. The effectful edge:
@@ -497,7 +570,7 @@ pub(crate) fn run(review: &[FileChange], editor: &impl EditorLauncher) -> io::Re
 }
 
 const HELP: &str =
-    " j/k move · ^d/^u/^f/^b scroll · gg/G ends · / search · n/N matches · ↵ edit · q quit ";
+    " j/k move · {/} files · ^d/^u scroll · gg/G ends · / search · n/N matches · ↵ edit · q quit ";
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -578,10 +651,16 @@ fn open_in_editor(
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, footer: &str) {
+    let position = if app.stops.is_empty() {
+        String::new()
+    } else {
+        format!(" {}/{} ", app.cursor + 1, app.stops.len())
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" absolem — shape of the change ")
-        .title_bottom(footer);
+        .title(format!(" absolem · {} ", app.summary))
+        .title_bottom(footer)
+        .title_bottom(Line::from(position).right_aligned());
     // Record the inner height so scroll clamping matches what's on screen,
     // and re-follow the cursor in case a resize moved it out of view.
     app.viewport_height = block.inner(frame.area()).height;
@@ -935,6 +1014,61 @@ mod tests {
         assert_eq!(input.feed(KeyCode::Char('x'), false), None); // zx → nothing
         // State cleared: a following motion decodes normally.
         assert_eq!(input.feed(KeyCode::Char('j'), false), Some(Motion::Down(1)));
+    }
+
+    #[test]
+    fn input_decodes_file_hops_with_counts() {
+        let mut input = InputState::default();
+        assert_eq!(
+            input.feed(KeyCode::Char('{'), false),
+            Some(Motion::PrevFile(1))
+        );
+        assert_eq!(input.feed(KeyCode::Char('2'), false), None);
+        assert_eq!(
+            input.feed(KeyCode::Char('}'), false),
+            Some(Motion::NextFile(2))
+        );
+    }
+
+    #[test]
+    fn file_hops_move_between_headers_and_saturate() {
+        let mut app = three_files(); // headers at stops 0, 2, 4
+        app.viewport_height = 20;
+        assert_eq!(app.headers, vec![0, 2, 4]);
+        app.next_file(1);
+        assert_eq!(app.cursor, 2);
+        app.next_file(5); // saturates at the last header
+        assert_eq!(app.cursor, 4);
+        app.cursor_down(1); // onto c.go's change row
+        app.prev_file(1);
+        assert_eq!(app.cursor, 4);
+        app.prev_file(2);
+        assert_eq!(app.cursor, 0);
+        app.prev_file(1); // already at the first header: stays
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn summary_counts_files_and_changes() {
+        let review = vec![
+            changed(
+                "a.go",
+                vec![
+                    Change::Added(item("A", "func A()")),
+                    Change::Modified {
+                        before: item("B", "func B()"),
+                        after: item("B", "func B(x int)"),
+                    },
+                    Change::Removed(item("C", "func C()")),
+                ],
+            ),
+            FileChange {
+                path: PathBuf::from("gone.go"),
+                kind: FileChangeKind::Deleted,
+            },
+        ];
+        assert_eq!(summarize(&review), "2 files · +1 ~1 -1");
+        assert_eq!(summarize(&review[..1]), "1 file · +1 ~1 -1");
     }
 
     #[test]
