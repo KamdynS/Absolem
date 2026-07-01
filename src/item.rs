@@ -59,4 +59,11 @@ pub(crate) enum Kind {
     Enum,
     Trait,
     Static,
+    // Members of a composite item, named `Parent.child` (Go) or
+    // `Parent::child` (Rust). Extracted as their own items so a field or
+    // variant change diffs to exactly that member, not a whole-type blur.
+    // Distinct from `Method` so `Client.Close` the interface requirement
+    // and `Client.Close` the concrete method never collide on identity.
+    Field,
+    InterfaceMethod,
 }

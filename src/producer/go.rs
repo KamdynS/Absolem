@@ -76,10 +76,8 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
         "type_declaration" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if matches!(child.kind(), "type_spec" | "type_alias")
-                    && let Some(item) = type_spec_item(child, source, path)
-                {
-                    out.push(item);
+                if matches!(child.kind(), "type_spec" | "type_alias") {
+                    emit_type_spec(child, source, path, out);
                 }
             }
         }
@@ -139,10 +137,17 @@ fn signature_without_body(node: Node<'_>, source: &str) -> String {
     source[node.start_byte()..end].trim().to_owned()
 }
 
-fn type_spec_item(spec: Node<'_>, source: &str, path: &Path) -> Option<Item> {
-    let name_node = spec.child_by_field_name("name")?;
+/// Emits the item for one `type_spec` / `type_alias`, then — for structs
+/// and interfaces — one item per member, so a member change diffs to
+/// exactly that member.
+fn emit_type_spec(spec: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
+    let Some(name_node) = spec.child_by_field_name("name") else {
+        return;
+    };
     let name = &source[name_node.byte_range()];
-    let ty_node = spec.child_by_field_name("type")?;
+    let Some(ty_node) = spec.child_by_field_name("type") else {
+        return;
+    };
     let is_alias = spec.kind() == "type_alias";
     let (kind, signature) = match ty_node.kind() {
         "struct_type" => (Kind::Struct, format!("type {name} struct")),
@@ -156,7 +161,7 @@ fn type_spec_item(spec: Node<'_>, source: &str, path: &Path) -> Option<Item> {
             }
         }
     };
-    Some(Item {
+    out.push(Item {
         id: ItemId {
             path: path.to_path_buf(),
             kind,
@@ -164,7 +169,97 @@ fn type_spec_item(spec: Node<'_>, source: &str, path: &Path) -> Option<Item> {
         },
         signature,
         line: start_line(spec),
-    })
+    });
+    match ty_node.kind() {
+        "struct_type" => emit_struct_fields(ty_node, source, path, name, out),
+        "interface_type" => emit_interface_members(ty_node, source, path, name, out),
+        _ => {}
+    }
+}
+
+/// One `Item` per `field_declaration`, named `Struct.field`. Multi-name
+/// fields (`a, b int`) collapse to one item keyed by the first name,
+/// like multi-name const/var specs. Embedded fields are keyed by their
+/// type text (pointer stripped) and read `Struct embeds Type`.
+fn emit_struct_fields(
+    struct_ty: Node<'_>,
+    source: &str,
+    path: &Path,
+    parent: &str,
+    out: &mut Surface,
+) {
+    let Some(list) = struct_ty.named_child(0) else {
+        return;
+    };
+    let mut cursor = list.walk();
+    for field in list.named_children(&mut cursor) {
+        if field.kind() != "field_declaration" {
+            continue;
+        }
+        let mut name_cursor = field.walk();
+        let mut names = field.children_by_field_name("name", &mut name_cursor);
+        let (name, signature) = if let Some(first) = names.next() {
+            let field_text = normalize_whitespace(&source[field.byte_range()]);
+            (
+                source[first.byte_range()].to_owned(),
+                format!("{parent}.{field_text}"),
+            )
+        } else {
+            // No name field: an embedded type.
+            let Some(ty) = field.child_by_field_name("type") else {
+                continue;
+            };
+            let ty_text = normalize_whitespace(unwrap_pointer(ty, source));
+            (ty_text.clone(), format!("{parent} embeds {ty_text}"))
+        };
+        out.push(Item {
+            id: ItemId {
+                path: path.to_path_buf(),
+                kind: Kind::Field,
+                name: format!("{parent}.{name}"),
+            },
+            signature,
+            line: start_line(field),
+        });
+    }
+}
+
+/// One `Item` per interface member: `method_elem`s become
+/// `Interface.Method(sig)`, embedded interfaces and type constraints
+/// (`type_elem`) read `Interface embeds T`.
+fn emit_interface_members(
+    iface_ty: Node<'_>,
+    source: &str,
+    path: &Path,
+    parent: &str,
+    out: &mut Surface,
+) {
+    let mut cursor = iface_ty.walk();
+    for member in iface_ty.named_children(&mut cursor) {
+        let (name, signature) = match member.kind() {
+            "method_elem" => {
+                let Some(method) = name_field(member, source) else {
+                    continue;
+                };
+                let text = normalize_whitespace(&source[member.byte_range()]);
+                (method.to_owned(), format!("{parent}.{text}"))
+            }
+            "type_elem" => {
+                let text = normalize_whitespace(&source[member.byte_range()]);
+                (text.clone(), format!("{parent} embeds {text}"))
+            }
+            _ => continue,
+        };
+        out.push(Item {
+            id: ItemId {
+                path: path.to_path_buf(),
+                kind: Kind::InterfaceMethod,
+                name: format!("{parent}.{name}"),
+            },
+            signature,
+            line: start_line(member),
+        });
+    }
 }
 
 /// Splits `const (...)` / `var (...)` blocks into one `Item` per spec,
@@ -271,22 +366,81 @@ mod tests {
     }
 
     #[test]
-    fn struct_renders_without_body() {
-        let src = "package foo\n\ntype Client struct {\n    timeout int\n}\n";
+    fn struct_emits_header_then_one_item_per_field() {
+        let src = "package foo\n\ntype Client struct {\n    timeout int\n    retries int\n}\n";
         let items = extract(src);
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0].id.kind, Kind::Struct);
         assert_eq!(items[0].id.name, "Client");
         assert_eq!(items[0].signature, "type Client struct");
+        assert_eq!(items[1].id.kind, Kind::Field);
+        assert_eq!(items[1].id.name, "Client.timeout");
+        assert_eq!(items[1].signature, "Client.timeout int");
+        assert_eq!(items[2].id.name, "Client.retries");
+        assert_eq!(items[2].line.0, 5);
     }
 
     #[test]
-    fn interface_renders_without_body() {
-        let src = "package foo\n\ntype Reader interface {\n    Read(p []byte) (int, error)\n}\n";
+    fn multi_name_field_collapses_to_first_name() {
+        let src = "package foo\n\ntype P struct {\n    x, y float64\n}\n";
         let items = extract(src);
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].id.name, "P.x");
+        assert_eq!(items[1].signature, "P.x, y float64");
+    }
+
+    #[test]
+    fn field_tag_is_part_of_the_shape() {
+        let src = "package foo\n\ntype U struct {\n    Name string `json:\"name\"`\n}\n";
+        let items = extract(src);
+        assert_eq!(items[1].signature, "U.Name string `json:\"name\"`");
+    }
+
+    #[test]
+    fn embedded_field_reads_embeds_and_strips_pointer() {
+        let src = "package foo\n\ntype Client struct {\n    *Base\n    io.Reader\n}\n";
+        let items = extract(src);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].id.kind, Kind::Field);
+        assert_eq!(items[1].id.name, "Client.Base");
+        assert_eq!(items[1].signature, "Client embeds Base");
+        assert_eq!(items[2].id.name, "Client.io.Reader");
+        assert_eq!(items[2].signature, "Client embeds io.Reader");
+    }
+
+    #[test]
+    fn interface_emits_header_then_one_item_per_method() {
+        let src = "package foo\n\ntype Reader interface {\n    Read(p []byte) (int, error)\n    Close() error\n}\n";
+        let items = extract(src);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0].id.kind, Kind::Interface);
         assert_eq!(items[0].signature, "type Reader interface");
+        assert_eq!(items[1].id.kind, Kind::InterfaceMethod);
+        assert_eq!(items[1].id.name, "Reader.Read");
+        assert_eq!(items[1].signature, "Reader.Read(p []byte) (int, error)");
+        assert_eq!(items[2].id.name, "Reader.Close");
+        assert_eq!(items[2].signature, "Reader.Close() error");
+    }
+
+    #[test]
+    fn embedded_interface_reads_embeds() {
+        let src = "package foo\n\ntype ReadCloser interface {\n    Reader\n    io.Closer\n}\n";
+        let items = extract(src);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].id.kind, Kind::InterfaceMethod);
+        assert_eq!(items[1].id.name, "ReadCloser.Reader");
+        assert_eq!(items[1].signature, "ReadCloser embeds Reader");
+        assert_eq!(items[2].id.name, "ReadCloser.io.Closer");
+        assert_eq!(items[2].signature, "ReadCloser embeds io.Closer");
+    }
+
+    #[test]
+    fn empty_struct_and_interface_emit_no_members() {
+        let src = "package foo\n\ntype S struct{}\n\ntype I interface{}\n";
+        let items = extract(src);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.kind, Kind::Struct);
+        assert_eq!(items[1].id.kind, Kind::Interface);
     }
 
     #[test]
