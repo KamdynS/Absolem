@@ -3,6 +3,7 @@
 mod core;
 mod git;
 mod item;
+mod json;
 mod producer;
 mod render;
 mod surface;
@@ -34,8 +35,34 @@ struct Cli {
     /// Print plain text instead of opening the interactive view. The
     /// default already falls back to plain text when stdout is not a
     /// terminal, so this is for forcing it (e.g. piping into a pager).
-    #[arg(long)]
+    #[arg(long, group = "output")]
     plain: bool,
+
+    /// Emit the review as JSON (schema-versioned), for machine consumers
+    /// like editor plugins.
+    #[arg(long, group = "output")]
+    json: bool,
+}
+
+/// Which frontend gets the review. Decided once, at the edge, from the
+/// flags and whether stdout is a terminal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Interactive,
+    Plain,
+    Json,
+}
+
+impl Cli {
+    fn output_mode(&self) -> OutputMode {
+        if self.json {
+            OutputMode::Json
+        } else if self.plain || !std::io::stdout().is_terminal() {
+            OutputMode::Plain
+        } else {
+            OutputMode::Interactive
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -66,12 +93,18 @@ fn main() -> Result<()> {
 
     let review = build_review(&git, &mut registry, &base_rev, &range.head, &source_files)?;
 
-    if cli.plain || !std::io::stdout().is_terminal() {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        render::render_review(&mut out, &review)?;
-    } else {
-        tui::run(&review).context("interactive view failed")?;
+    match cli.output_mode() {
+        OutputMode::Plain => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            render::render_review(&mut out, &review)?;
+        }
+        OutputMode::Json => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            json::render_json(&mut out, &review)?;
+        }
+        OutputMode::Interactive => tui::run(&review).context("interactive view failed")?,
     }
 
     Ok(())
