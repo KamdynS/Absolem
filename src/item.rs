@@ -66,4 +66,11 @@ pub(crate) enum Kind {
     // and `Client.Close` the concrete method never collide on identity.
     Field,
     InterfaceMethod,
+    // Rust-side members: enum variants, trait-declared methods (required
+    // or default), and associated types in traits and impls. Associated
+    // consts reuse `Const` — their `Parent::NAME` id cannot collide with
+    // a top-level const.
+    Variant,
+    TraitMethod,
+    AssocType,
 }
