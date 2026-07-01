@@ -18,8 +18,43 @@ use clap::Parser;
 
 use crate::core::{FileChange, FileChangeKind, diff};
 use crate::git::{ChangeStatus, ChangedFile, DiffMode, GitRepo, RealGit, RefRange};
+use crate::item::Line;
 use crate::producer::{Producer, ProducerError, Registry};
 use crate::surface::Surface;
+use crate::tui::EditorLauncher;
+
+/// The real `$EDITOR`, invoked as `editor +LINE PATH` — the convention
+/// the vi lineage, nano, and emacs all accept. Constructed only here,
+/// at the composition root.
+struct RealEditor {
+    program: String,
+}
+
+impl RealEditor {
+    fn from_env() -> Self {
+        let program = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_owned());
+        Self { program }
+    }
+}
+
+impl EditorLauncher for RealEditor {
+    fn open(&self, path: &Path, line: Line) -> std::io::Result<()> {
+        let status = std::process::Command::new(&self.program)
+            .arg(format!("+{line}"))
+            .arg(path)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "{} exited with {status}",
+                self.program
+            )))
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -118,7 +153,9 @@ fn main() -> Result<()> {
             let mut out = stdout.lock();
             markdown::render_markdown(&mut out, &review)?;
         }
-        OutputMode::Interactive => tui::run(&review).context("interactive view failed")?,
+        OutputMode::Interactive => {
+            tui::run(&review, &RealEditor::from_env()).context("interactive view failed")?;
+        }
     }
 
     Ok(())

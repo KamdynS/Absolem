@@ -16,6 +16,7 @@
 //! navigation across refs — just shape.
 
 use std::io;
+use std::path::{Path, PathBuf};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -24,6 +25,24 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::core::{Change, FileChange, FileChangeKind};
+use crate::item::Line as SourceLine;
+
+/// The authority to open the user's editor at a location. A capability
+/// (STYLE §3): the TUI cannot spawn a process any other way, and tests
+/// hand in a recording fake. Only the composition root constructs the
+/// real, `$EDITOR`-backed implementation.
+pub(crate) trait EditorLauncher {
+    fn open(&self, path: &Path, line: SourceLine) -> io::Result<()>;
+}
+
+/// Where a cursor stop leads when opened: the file and line of the item
+/// at the ref under review. Removed items have nowhere to go — they no
+/// longer exist on the head side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JumpTarget {
+    path: PathBuf,
+    line: SourceLine,
+}
 
 /// A review turned into display lines plus the indices of the lines the
 /// cursor may land on. Blank separators and `was:` continuation rows are
@@ -31,6 +50,8 @@ use crate::core::{Change, FileChange, FileChangeKind};
 struct Rendered {
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
+    /// Parallel to `stops`: where each stop jumps when opened.
+    jumps: Vec<Option<JumpTarget>>,
 }
 
 /// A decoded normal-mode command. `usize` payloads are repeat counts; the
@@ -58,6 +79,8 @@ enum Motion {
     ViewBottom,
     NextMatch,
     PrevMatch,
+    /// `Enter` — open the cursor's item in the user's editor.
+    Open,
     Quit,
 }
 
@@ -155,6 +178,7 @@ impl InputState {
             (false, KeyCode::Char('L')) => Motion::CursorLow,
             (false, KeyCode::Char('n')) => Motion::NextMatch,
             (false, KeyCode::Char('N')) => Motion::PrevMatch,
+            (false, KeyCode::Enter) => Motion::Open,
             _ => return None,
         };
         Some(motion)
@@ -168,6 +192,8 @@ impl InputState {
 struct App {
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
+    /// Parallel to `stops`: where each stop jumps when opened.
+    jumps: Vec<Option<JumpTarget>>,
     /// Stop indices whose row matched the last committed search.
     matches: Vec<usize>,
     cursor: usize,
@@ -177,15 +203,25 @@ struct App {
 
 impl App {
     fn new(review: &[FileChange]) -> Self {
-        let Rendered { lines, stops } = render_lines(review);
+        let Rendered {
+            lines,
+            stops,
+            jumps,
+        } = render_lines(review);
         Self {
             lines,
             stops,
+            jumps,
             matches: Vec::new(),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
         }
+    }
+
+    /// Where the cursor's stop leads, if anywhere.
+    fn current_jump(&self) -> Option<&JumpTarget> {
+        self.jumps.get(self.cursor).and_then(Option::as_ref)
     }
 
     /// Largest valid top-line index: enough to bring the final line into
@@ -226,7 +262,9 @@ impl App {
             Motion::ViewBottom => self.scroll_cursor_to(ViewSpot::Bottom),
             Motion::NextMatch => self.next_match(),
             Motion::PrevMatch => self.prev_match(),
-            Motion::Quit => {}
+            // Open and Quit act on the world outside the pane; the event
+            // loop handles them.
+            Motion::Open | Motion::Quit => {}
         }
     }
 
@@ -375,27 +413,42 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-/// Turns a review into the styled lines the pane scrolls over and the set of
-/// cursor stops. Files are separated by a blank line, mirroring the
-/// plain-text frontend. Stops are the file headers and the change rows; the
-/// blank separators and the `was:` continuation lines are skipped.
+/// Turns a review into the styled lines the pane scrolls over, the set of
+/// cursor stops, and each stop's jump target. Files are separated by a
+/// blank line, mirroring the plain-text frontend. Stops are the file
+/// headers and the change rows; the blank separators and the `was:`
+/// continuation lines are skipped. File headers jump to line 1; added and
+/// modified rows jump to the item's head-side line; removed rows and
+/// deleted files have nowhere to go.
 fn render_lines(review: &[FileChange]) -> Rendered {
     let mut lines = Vec::new();
     let mut stops = Vec::new();
+    let mut jumps = Vec::new();
     if review.is_empty() {
         lines.push(Line::from("No structural changes.").dim());
-        return Rendered { lines, stops };
+        return Rendered {
+            lines,
+            stops,
+            jumps,
+        };
     }
-    let stop = |lines: &[Line<'static>], stops: &mut Vec<u16>| {
-        stops.push(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-    };
     for (i, file) in review.iter().enumerate() {
         if i > 0 {
             lines.push(Line::default());
         }
+        let stop = |lines: &[Line<'static>],
+                    stops: &mut Vec<u16>,
+                    jumps: &mut Vec<Option<JumpTarget>>,
+                    target: Option<SourceLine>| {
+            stops.push(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            jumps.push(target.map(|line| JumpTarget {
+                path: file.path.clone(),
+                line,
+            }));
+        };
         match &file.kind {
             FileChangeKind::Deleted => {
-                stop(&lines, &mut stops);
+                stop(&lines, &mut stops, &mut jumps, None);
                 lines.push(
                     Line::from(format!("DELETED {}", file.path.display()))
                         .red()
@@ -403,18 +456,20 @@ fn render_lines(review: &[FileChange]) -> Rendered {
                 );
             }
             FileChangeKind::Changed(changeset) => {
-                stop(&lines, &mut stops);
+                stop(&lines, &mut stops, &mut jumps, Some(SourceLine(1)));
                 lines.push(Line::from(file.path.display().to_string()).bold());
                 for change in &changeset.changes {
-                    stop(&lines, &mut stops);
                     match change {
                         Change::Added(item) => {
+                            stop(&lines, &mut stops, &mut jumps, Some(item.line));
                             lines.push(Line::from(format!("  + {}", item.signature)).green());
                         }
                         Change::Removed(item) => {
+                            stop(&lines, &mut stops, &mut jumps, None);
                             lines.push(Line::from(format!("  - {}", item.signature)).red());
                         }
                         Change::Modified { before, after } => {
+                            stop(&lines, &mut stops, &mut jumps, Some(after.line));
                             lines.push(Line::from(format!("  ~ {}", after.signature)).yellow());
                             lines
                                 .push(Line::from(format!("      was: {}", before.signature)).dim());
@@ -424,30 +479,40 @@ fn render_lines(review: &[FileChange]) -> Rendered {
             }
         }
     }
-    Rendered { lines, stops }
+    Rendered {
+        lines,
+        stops,
+        jumps,
+    }
 }
 
 /// Runs the interactive view until the user quits. The effectful edge:
 /// sets up the terminal (raw mode + alternate screen via `ratatui::init`),
 /// pumps key events, and restores the terminal on the way out.
-pub(crate) fn run(review: &[FileChange]) -> io::Result<()> {
+pub(crate) fn run(review: &[FileChange], editor: &impl EditorLauncher) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut App::new(review));
+    let result = event_loop(&mut terminal, &mut App::new(review), editor);
     ratatui::restore();
     result
 }
 
-const HELP: &str = " j/k move · ^d/^u/^f/^b scroll · gg/G ends · H/M/L view · zt/zz/zb center · / search · n/N matches · q quit ";
+const HELP: &str =
+    " j/k move · ^d/^u/^f/^b scroll · gg/G ends · / search · n/N matches · ↵ edit · q quit ";
 
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    editor: &impl EditorLauncher,
+) -> io::Result<()> {
     let mut input = InputState::default();
     let mut mode = Mode::Normal;
     let mut query = String::new();
+    let mut notice: Option<String> = None;
     loop {
         let footer = if mode == Mode::Search {
             format!(" /{query} ")
         } else {
-            HELP.to_owned()
+            notice.take().unwrap_or_else(|| HELP.to_owned())
         };
         terminal.draw(|frame| draw(frame, app, &footer))?;
         let Event::Key(key) = event::read()? else {
@@ -478,14 +543,38 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                     mode = Mode::Search;
                     query.clear();
                 } else if let Some(motion) = input.feed(key.code, ctrl) {
-                    if motion == Motion::Quit {
-                        return Ok(());
+                    match motion {
+                        Motion::Quit => return Ok(()),
+                        Motion::Open => notice = open_in_editor(terminal, app, editor)?,
+                        _ => app.apply(motion),
                     }
-                    app.apply(motion);
                 }
             }
         }
     }
+}
+
+/// Opens the cursor's item in the user's editor, suspending the TUI
+/// around the child process: the terminal is restored before the editor
+/// takes the tty and re-initialized after it exits. Returns a footer
+/// notice when there is nothing to open or the editor failed; editor
+/// failure is a notice rather than an error because the review is still
+/// usable.
+fn open_in_editor(
+    terminal: &mut DefaultTerminal,
+    app: &App,
+    editor: &impl EditorLauncher,
+) -> io::Result<Option<String>> {
+    let Some(target) = app.current_jump() else {
+        return Ok(Some(
+            " nothing to open here (removed items have no location) ".to_owned(),
+        ));
+    };
+    ratatui::restore();
+    let opened = editor.open(&target.path, target.line);
+    *terminal = ratatui::init();
+    terminal.clear()?;
+    Ok(opened.err().map(|e| format!(" editor failed: {e} ")))
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, footer: &str) {
@@ -846,6 +935,62 @@ mod tests {
         assert_eq!(input.feed(KeyCode::Char('x'), false), None); // zx → nothing
         // State cleared: a following motion decodes normally.
         assert_eq!(input.feed(KeyCode::Char('j'), false), Some(Motion::Down(1)));
+    }
+
+    #[test]
+    fn input_decodes_enter_as_open() {
+        let mut input = InputState::default();
+        assert_eq!(input.feed(KeyCode::Enter, false), Some(Motion::Open));
+    }
+
+    #[test]
+    fn stops_jump_to_head_side_lines() {
+        let with_lines = |name: &str, sig: &str, line: u32| {
+            let mut i = item(name, sig);
+            i.line = crate::item::Line(line);
+            i
+        };
+        let app = App::new(&[
+            changed(
+                "a.go",
+                vec![
+                    Change::Added(with_lines("A", "func A()", 10)),
+                    Change::Modified {
+                        before: with_lines("B", "func B()", 12),
+                        after: with_lines("B", "func B(x int)", 20),
+                    },
+                    Change::Removed(with_lines("C", "func C()", 30)),
+                ],
+            ),
+            FileChange {
+                path: PathBuf::from("gone.go"),
+                kind: FileChangeKind::Deleted,
+            },
+        ]);
+        let jump = |i: usize| app.jumps[i].clone();
+        // File header jumps to the top of the file.
+        assert_eq!(
+            jump(0),
+            Some(JumpTarget {
+                path: PathBuf::from("a.go"),
+                line: crate::item::Line(1),
+            })
+        );
+        // Added jumps to its line; modified to the *after* line.
+        assert_eq!(jump(1).unwrap().line, crate::item::Line(10));
+        assert_eq!(jump(2).unwrap().line, crate::item::Line(20));
+        // Removed items and deleted files have nowhere to go.
+        assert_eq!(jump(3), None);
+        assert_eq!(jump(4), None);
+    }
+
+    #[test]
+    fn current_jump_follows_the_cursor() {
+        let mut app = App::new(&[changed("a.go", vec![Change::Added(item("A", "func A()"))])]);
+        app.viewport_height = 10;
+        assert_eq!(app.current_jump().unwrap().line, crate::item::Line(1));
+        app.cursor_down(1);
+        assert_eq!(app.current_jump().unwrap().path, PathBuf::from("a.go"));
     }
 
     #[test]
