@@ -705,6 +705,8 @@ mod tests {
             signature: sig.into(),
             // Qualified: `Line` unqualified is ratatui's in this module.
             line: crate::item::Line(1),
+            parent: None,
+            refs: Vec::new(),
         }
     }
 

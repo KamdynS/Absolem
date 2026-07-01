@@ -62,6 +62,8 @@ mod tests {
             },
             signature: sig.into(),
             line: Line(1),
+            parent: None,
+            refs: Vec::new(),
         }
     }
 

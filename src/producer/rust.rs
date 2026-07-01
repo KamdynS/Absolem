@@ -24,9 +24,68 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
-use crate::item::{Item, ItemId, Kind, Line};
+use crate::item::{Item, ItemId, Kind, Line, TypeRef};
 use crate::producer::{Producer, ProducerError};
 use crate::surface::Surface;
+
+/// Collects the type names a declaration references — `type_identifier`
+/// nodes — in source order, deduped, skipping `Self`, `exclude`d names
+/// (the item's own type and its declared generic parameters), and
+/// everything at or past `cut` (the body/initialiser). Primitives are a
+/// different node kind, so they never appear.
+fn collect_refs(
+    node: Node<'_>,
+    source: &str,
+    cut: Option<usize>,
+    exclude: &[&str],
+) -> Vec<TypeRef> {
+    let mut out: Vec<TypeRef> = Vec::new();
+    let mut push = |text: &str| {
+        if text == "Self" || exclude.contains(&text) {
+            return;
+        }
+        if out.iter().all(|r| r.0 != text) {
+            out.push(TypeRef(text.to_owned()));
+        }
+    };
+    collect_refs_into(node, source, cut, &mut push);
+    out
+}
+
+fn collect_refs_into(
+    node: Node<'_>,
+    source: &str,
+    cut: Option<usize>,
+    push: &mut impl FnMut(&str),
+) {
+    if cut.is_some_and(|c| node.start_byte() >= c) {
+        return;
+    }
+    if node.kind() == "type_identifier" {
+        push(&source[node.byte_range()]);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_refs_into(child, source, cut, push);
+    }
+}
+
+/// The generic parameter names a node declares (`T`, `E`) — uses of
+/// these are not references to API types.
+fn type_param_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    let Some(params) = node.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        if let Some(name) = first_type_identifier(param, source) {
+            out.push(name);
+        }
+    }
+    out
+}
 
 pub(crate) struct RustProducer {
     parser: Parser,
@@ -81,6 +140,16 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
     }
 }
 
+/// The exclude list for reference collection on a top-level item: its
+/// own name plus its declared generic parameters.
+fn own_excludes<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    let mut excludes = type_param_names(node, source);
+    if let Some(name) = name_field(node, source) {
+        excludes.push(name);
+    }
+    excludes
+}
+
 /// One `Item` per struct field. Named fields key as `Struct::field`;
 /// tuple fields key positionally as `Struct::0`, `Struct::1`, …
 fn extract_struct_fields(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
@@ -90,6 +159,7 @@ fn extract_struct_fields(node: Node<'_>, source: &str, path: &Path, out: &mut Su
     let Some(body) = node.child_by_field_name("body") else {
         return;
     };
+    let excludes = own_excludes(node, source);
     match body.kind() {
         "field_declaration_list" => {
             let mut cursor = body.walk();
@@ -106,7 +176,9 @@ fn extract_struct_fields(node: Node<'_>, source: &str, path: &Path, out: &mut Su
                     path,
                     Kind::Field,
                     format!("{parent}::{name}"),
+                    parent,
                     None,
+                    &excludes,
                     out,
                 );
             }
@@ -137,6 +209,8 @@ fn extract_struct_fields(node: Node<'_>, source: &str, path: &Path, out: &mut Su
                     },
                     signature,
                     line: start_line(child),
+                    parent: Some(parent.to_owned()),
+                    refs: collect_refs(child, source, None, &excludes),
                 });
                 index += 1;
             }
@@ -154,6 +228,7 @@ fn extract_variants(node: Node<'_>, source: &str, path: &Path, out: &mut Surface
     let Some(body) = node.child_by_field_name("body") else {
         return;
     };
+    let excludes = own_excludes(node, source);
     let mut cursor = body.walk();
     for variant in body.named_children(&mut cursor) {
         if variant.kind() != "enum_variant" {
@@ -168,7 +243,9 @@ fn extract_variants(node: Node<'_>, source: &str, path: &Path, out: &mut Surface
             path,
             Kind::Variant,
             format!("{parent}::{name}"),
+            parent,
             None,
+            &excludes,
             out,
         );
     }
@@ -184,6 +261,7 @@ fn extract_trait_members(node: Node<'_>, source: &str, path: &Path, out: &mut Su
     let Some(body) = node.child_by_field_name("body") else {
         return;
     };
+    let parent_excludes = own_excludes(node, source);
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
         let kind = match member.kind() {
@@ -195,13 +273,17 @@ fn extract_trait_members(node: Node<'_>, source: &str, path: &Path, out: &mut Su
         let Some(name) = name_field(member, source) else {
             continue;
         };
+        let mut excludes = parent_excludes.clone();
+        excludes.extend(type_param_names(member, source));
         push_member(
             member,
             source,
             path,
             kind,
             format!("{parent}::{name}"),
+            parent,
             member_cut(member),
+            &excludes,
             out,
         );
     }
@@ -229,6 +311,8 @@ fn push_named(
         },
         signature: signature(node, source, cut),
         line: start_line(node),
+        parent: None,
+        refs: collect_refs(node, source, cut, &own_excludes(node, source)),
     });
 }
 
@@ -250,6 +334,11 @@ fn extract_impl(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
     let Some(body) = node.child_by_field_name("body") else {
         return;
     };
+    let mut impl_excludes = type_param_names(node, source);
+    impl_excludes.push(type_name);
+    if let Some(tr) = trait_name {
+        impl_excludes.push(tr);
+    }
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         let kind = match child.kind() {
@@ -265,20 +354,38 @@ fn extract_impl(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
             || format!("{type_name}::{member}"),
             |tr| format!("<{type_name} as {tr}>::{member}"),
         );
-        push_member(child, source, path, kind, qualified, member_cut(child), out);
+        let mut excludes = impl_excludes.clone();
+        excludes.extend(type_param_names(child, source));
+        push_member(
+            child,
+            source,
+            path,
+            kind,
+            qualified,
+            type_name,
+            member_cut(child),
+            &excludes,
+            out,
+        );
     }
 }
 
-/// Pushes one member of a composite item: its id is `qualified`, and its
+/// Pushes one member of a composite item: its id is `qualified`, its
 /// signature is the member's declaration text with `qualified` spliced
-/// over the bare name, so the rendered line is self-contained.
+/// over the bare name (so the rendered line is self-contained), and its
+/// parent is the bare name of the composite it belongs to. `exclude`
+/// names never become refs: the parent, its generic parameters, and the
+/// member's own.
+#[allow(clippy::too_many_arguments)]
 fn push_member(
     node: Node<'_>,
     source: &str,
     path: &Path,
     kind: Kind,
     qualified: String,
+    parent: &str,
     cut: Option<usize>,
+    exclude: &[&str],
     out: &mut Surface,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
@@ -293,6 +400,8 @@ fn push_member(
         },
         signature,
         line: start_line(node),
+        parent: Some(parent.to_owned()),
+        refs: collect_refs(node, source, cut, exclude),
     });
 }
 
@@ -606,5 +715,36 @@ mod tests {
         let lines: Vec<u32> = items.iter().map(|i| i.line.0).collect();
         // S on line 1; the method on line 4 inside the impl block.
         assert_eq!(lines, vec![1, 4]);
+    }
+    #[test]
+    fn items_carry_type_refs_excluding_generics_and_self() {
+        let items = extract(concat!(
+            "pub struct Client<T> {\n    inner: T,\n    pool: Pool,\n}\n",
+            "impl<T> Client<T> {\n    pub fn send(&self, m: Message) -> Result<Ack, SendError> { todo!() }\n}\n",
+        ));
+        // struct header: no refs (T is its own generic, own name excluded)
+        assert!(items[0].refs.is_empty());
+        // field `inner: T` — the generic is not a ref
+        assert!(items[1].refs.is_empty());
+        let pool: Vec<&str> = items[2].refs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(pool, vec!["Pool"]);
+        assert_eq!(items[2].parent.as_deref(), Some("Client"));
+        let send: Vec<&str> = items[3].refs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(send, vec!["Message", "Result", "Ack", "SendError"]);
+        assert_eq!(items[3].parent.as_deref(), Some("Client"));
+    }
+
+    #[test]
+    fn variants_and_trait_members_carry_parent() {
+        let items = extract(concat!(
+            "pub enum State {\n    Running(Handle),\n}\n",
+            "pub trait Reader {\n    fn read(&self) -> Chunk;\n}\n",
+        ));
+        assert_eq!(items[1].parent.as_deref(), Some("State"));
+        let variant_refs: Vec<&str> = items[1].refs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(variant_refs, vec!["Handle"]);
+        assert_eq!(items[3].parent.as_deref(), Some("Reader"));
+        let method_refs: Vec<&str> = items[3].refs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(method_refs, vec!["Chunk"]);
     }
 }

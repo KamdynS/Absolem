@@ -26,6 +26,14 @@ impl fmt::Display for Line {
     }
 }
 
+/// A reference from an item's signature to a type it uses, as written
+/// in the source (pointer/reference sugar stripped). At the syntactic
+/// tier these are *displayed* names only — resolution to an `ItemId`
+/// happens by name lookup where Surfaces aggregate, and gets exact
+/// later, when a semantic tier lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypeRef(pub(crate) String);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Item {
     pub(crate) id: ItemId,
@@ -33,6 +41,15 @@ pub(crate) struct Item {
     /// Where the item's declaration starts at the ref it was extracted
     /// from.
     pub(crate) line: Line,
+    /// The composite this item is a member of — the *name* of the
+    /// enclosing struct/interface/enum/trait (or a method's receiver
+    /// type). A name, not an `ItemId`: a producer sees one file, and the
+    /// parent of an `impl` member may be declared in another. Grouping
+    /// resolves it against the same file's items and degrades to a flat
+    /// row when nothing matches.
+    pub(crate) parent: Option<String>,
+    /// Types this item's signature references, in source order, deduped.
+    pub(crate) refs: Vec<TypeRef>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

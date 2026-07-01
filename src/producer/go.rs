@@ -13,9 +13,81 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
-use crate::item::{Item, ItemId, Kind, Line};
+use crate::item::{Item, ItemId, Kind, Line, TypeRef};
 use crate::producer::{Producer, ProducerError};
 use crate::surface::Surface;
+
+/// Go's predeclared identifiers — never worth a `TypeRef`.
+const GO_PREDECLARED: &[&str] = &[
+    "any",
+    "bool",
+    "byte",
+    "comparable",
+    "complex64",
+    "complex128",
+    "error",
+    "float32",
+    "float64",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "rune",
+    "string",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+];
+
+/// Collects the type names a declaration references — `type_identifier`
+/// and whole `qualified_type` nodes — in source order, deduped, skipping
+/// predeclared identifiers, `exclude`d names (the item's own type), and
+/// everything at or past `cut` (the body).
+fn collect_refs(
+    node: Node<'_>,
+    source: &str,
+    cut: Option<usize>,
+    exclude: &[&str],
+) -> Vec<TypeRef> {
+    let mut out: Vec<TypeRef> = Vec::new();
+    let mut push = |text: &str| {
+        if GO_PREDECLARED.contains(&text) || exclude.contains(&text) {
+            return;
+        }
+        if out.iter().all(|r| r.0 != text) {
+            out.push(TypeRef(text.to_owned()));
+        }
+    };
+    collect_refs_into(node, source, cut, &mut push);
+    out
+}
+
+fn collect_refs_into(
+    node: Node<'_>,
+    source: &str,
+    cut: Option<usize>,
+    push: &mut impl FnMut(&str),
+) {
+    if cut.is_some_and(|c| node.start_byte() >= c) {
+        return;
+    }
+    match node.kind() {
+        // A qualified type (`io.Reader`) is kept whole, not descended.
+        "qualified_type" | "type_identifier" => {
+            push(&source[node.byte_range()]);
+            return;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_refs_into(child, source, cut, push);
+    }
+}
 
 pub(crate) struct GoProducer {
     parser: Parser,
@@ -57,19 +129,27 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
                     },
                     signature: signature_without_body(node, source),
                     line: start_line(node),
+                    parent: None,
+                    refs: collect_refs(node, source, body_start(node), &[]),
                 });
             }
         }
         "method_declaration" => {
-            if let Some(method_name) = method_name(node, source) {
+            let receiver = node
+                .child_by_field_name("receiver")
+                .and_then(|r| receiver_type_name(r, source));
+            if let (Some(method), Some(receiver)) = (name_field(node, source), receiver) {
                 out.push(Item {
                     id: ItemId {
                         path: path.to_path_buf(),
                         kind: Kind::Method,
-                        name: method_name,
+                        name: format!("{receiver}.{method}"),
                     },
                     signature: signature_without_body(node, source),
                     line: start_line(node),
+                    parent: Some(receiver.to_owned()),
+                    // The receiver type is the parent, not a reference.
+                    refs: collect_refs(node, source, body_start(node), &[receiver]),
                 });
             }
         }
@@ -99,16 +179,16 @@ fn name_field<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
         .map(|n| &source[n.byte_range()])
 }
 
-/// `Receiver.Method`; the receiver is the type name with `*` stripped so
-/// `func (c *Client) X()` and `func (c Client) X()` collide as one id.
-/// Go's rules forbid both existing simultaneously, so this is safe.
-fn method_name(node: Node<'_>, source: &str) -> Option<String> {
-    let method = name_field(node, source)?;
-    let receiver = node.child_by_field_name("receiver")?;
-    let receiver_type = receiver_type_name(receiver, source)?;
-    Some(format!("{receiver_type}.{method}"))
+/// Where a declaration's body starts, if it has one — the cut point for
+/// signatures and reference collection.
+fn body_start(node: Node<'_>) -> Option<usize> {
+    node.child_by_field_name("body").map(|b| b.start_byte())
 }
 
+/// Method ids are `Receiver.Method`; the receiver is the type name with
+/// `*` stripped so `func (c *Client) X()` and `func (c Client) X()`
+/// collide as one id. Go's rules forbid both existing simultaneously,
+/// so this is safe.
 fn receiver_type_name<'a>(receiver: Node<'a>, source: &'a str) -> Option<&'a str> {
     let mut cursor = receiver.walk();
     for param in receiver.children(&mut cursor) {
@@ -131,9 +211,7 @@ fn unwrap_pointer<'a>(ty: Node<'a>, source: &'a str) -> &'a str {
 }
 
 fn signature_without_body(node: Node<'_>, source: &str) -> String {
-    let end = node
-        .child_by_field_name("body")
-        .map_or_else(|| node.end_byte(), |b| b.start_byte());
+    let end = body_start(node).unwrap_or_else(|| node.end_byte());
     source[node.start_byte()..end].trim().to_owned()
 }
 
@@ -149,16 +227,31 @@ fn emit_type_spec(spec: Node<'_>, source: &str, path: &Path, out: &mut Surface) 
         return;
     };
     let is_alias = spec.kind() == "type_alias";
-    let (kind, signature) = match ty_node.kind() {
-        "struct_type" => (Kind::Struct, format!("type {name} struct")),
-        "interface_type" => (Kind::Interface, format!("type {name} interface")),
+    let (kind, signature, refs) = match ty_node.kind() {
+        // Headers of composites carry no refs; their members do.
+        "struct_type" => (Kind::Struct, format!("type {name} struct"), Vec::new()),
+        "interface_type" => (
+            Kind::Interface,
+            format!("type {name} interface"),
+            Vec::new(),
+        ),
         _ => {
             let ty = &source[ty_node.byte_range()];
-            if is_alias {
-                (Kind::TypeAlias, format!("type {name} = {ty}"))
+            let signature = if is_alias {
+                format!("type {name} = {ty}")
             } else {
-                (Kind::Type, format!("type {name} {ty}"))
-            }
+                format!("type {name} {ty}")
+            };
+            let kind = if is_alias {
+                Kind::TypeAlias
+            } else {
+                Kind::Type
+            };
+            (
+                kind,
+                signature,
+                collect_refs(ty_node, source, None, &[name]),
+            )
         }
     };
     out.push(Item {
@@ -169,6 +262,8 @@ fn emit_type_spec(spec: Node<'_>, source: &str, path: &Path, out: &mut Surface) 
         },
         signature,
         line: start_line(spec),
+        parent: None,
+        refs,
     });
     match ty_node.kind() {
         "struct_type" => emit_struct_fields(ty_node, source, path, name, out),
@@ -220,6 +315,8 @@ fn emit_struct_fields(
             },
             signature,
             line: start_line(field),
+            parent: Some(parent.to_owned()),
+            refs: collect_refs(field, source, None, &[parent]),
         });
     }
 }
@@ -258,6 +355,8 @@ fn emit_interface_members(
             },
             signature,
             line: start_line(member),
+            parent: Some(parent.to_owned()),
+            refs: collect_refs(member, source, None, &[parent]),
         });
     }
 }
@@ -296,6 +395,8 @@ fn emit_value_specs(
             },
             signature: format!("{prefix} {body}"),
             line: start_line(child),
+            parent: None,
+            refs: collect_refs(child, source, None, &[]),
         });
     }
 }
@@ -513,5 +614,32 @@ mod tests {
         let lines: Vec<u32> = items.iter().map(|i| i.line.0).collect();
         // A on line 3; X and Y on their own spec lines inside the block.
         assert_eq!(lines, vec![3, 6, 7]);
+    }
+    #[test]
+    fn items_carry_type_refs() {
+        let src = "package foo\n\nfunc Connect(addr string, cfg Config) (*Client, error) {\n    return nil, nil\n}\n";
+        let items = extract(src);
+        let refs: Vec<&str> = items[0].refs.iter().map(|r| r.0.as_str()).collect();
+        // string and error are predeclared; Config and Client are refs.
+        assert_eq!(refs, vec!["Config", "Client"]);
+    }
+
+    #[test]
+    fn members_and_methods_carry_parent_but_not_self_ref() {
+        let src = concat!(
+            "package foo\n",
+            "type Client struct {\n    conn net.Conn\n}\n",
+            "func (c *Client) Send(m Message) error { return nil }\n",
+        );
+        let items = extract(src);
+        // items: struct header, field, method
+        assert_eq!(items[0].parent, None);
+        assert_eq!(items[1].parent.as_deref(), Some("Client"));
+        let field_refs: Vec<&str> = items[1].refs.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(field_refs, vec!["net.Conn"]);
+        assert_eq!(items[2].parent.as_deref(), Some("Client"));
+        let method_refs: Vec<&str> = items[2].refs.iter().map(|r| r.0.as_str()).collect();
+        // The receiver type is the parent, not a reference.
+        assert_eq!(method_refs, vec!["Message"]);
     }
 }

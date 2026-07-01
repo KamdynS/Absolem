@@ -92,6 +92,8 @@ mod tests {
             },
             signature: sig.into(),
             line: Line(1),
+            parent: None,
+            refs: Vec::new(),
         }
     }
 
@@ -211,6 +213,8 @@ mod tests {
             },
             signature: "func F()".into(),
             line: Line(1),
+            parent: None,
+            refs: Vec::new(),
         };
         let b = Item {
             id: ItemId {
@@ -220,6 +224,8 @@ mod tests {
             },
             signature: "func F()".into(),
             line: Line(1),
+            parent: None,
+            refs: Vec::new(),
         };
         let cs = diff(&surface(vec![a]), &surface(vec![b]));
         assert_eq!(cs.changes.len(), 2);
