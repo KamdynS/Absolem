@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::style::{Modifier, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -511,6 +511,107 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// The two sides of a modified signature as spans, with the tokens that
+/// differ marked: struck out on the old side, bold and underlined on
+/// the new. A hand-rolled token LCS — signatures are one line, so the
+/// quadratic table is nothing.
+fn modified_spans(before: &str, after: &str) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let before_tokens = tokenize(before);
+    let after_tokens = tokenize(after);
+    let (before_common, after_common) = lcs_membership(&before_tokens, &after_tokens);
+    (
+        marked_spans(&before_tokens, &before_common, Modifier::CROSSED_OUT),
+        marked_spans(
+            &after_tokens,
+            &after_common,
+            Modifier::BOLD | Modifier::UNDERLINED,
+        ),
+    )
+}
+
+/// Splits into word runs (`[A-Za-z0-9_]+`) and single non-word
+/// characters, so a renamed parameter or a changed type marks as one
+/// token, not per character.
+fn tokenize(s: &str) -> Vec<&str> {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_word(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            out.push(&s[start..i]);
+        } else {
+            let len = s[i..].chars().next().map_or(1, char::len_utf8);
+            out.push(&s[i..i + len]);
+            i += len;
+        }
+    }
+    out
+}
+
+/// For each side, whether the token is part of the longest common
+/// subsequence — `false` means the token changed.
+fn lcs_membership(left: &[&str], right: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let (rows, cols) = (left.len(), right.len());
+    // table[row][col] = LCS length of left[row..] and right[col..].
+    let mut table = vec![vec![0u16; cols + 1]; rows + 1];
+    for row in (0..rows).rev() {
+        for col in (0..cols).rev() {
+            table[row][col] = if left[row] == right[col] {
+                table[row + 1][col + 1] + 1
+            } else {
+                table[row + 1][col].max(table[row][col + 1])
+            };
+        }
+    }
+    let (mut in_left, mut in_right) = (vec![false; rows], vec![false; cols]);
+    let (mut row, mut col) = (0, 0);
+    while row < rows && col < cols {
+        if left[row] == right[col] {
+            in_left[row] = true;
+            in_right[col] = true;
+            row += 1;
+            col += 1;
+        } else if table[row + 1][col] >= table[row][col + 1] {
+            row += 1;
+        } else {
+            col += 1;
+        }
+    }
+    (in_left, in_right)
+}
+
+/// Tokens back into spans, adjacent same-state tokens merged; tokens
+/// outside the common subsequence carry `marker`.
+fn marked_spans(tokens: &[&str], common: &[bool], marker: Modifier) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_common = true;
+    for (token, &is_common) in tokens.iter().zip(common) {
+        if is_common != run_common && !run.is_empty() {
+            out.push(span_for(std::mem::take(&mut run), run_common, marker));
+        }
+        run_common = is_common;
+        run.push_str(token);
+    }
+    if !run.is_empty() {
+        out.push(span_for(run, run_common, marker));
+    }
+    out
+}
+
+fn span_for(text: String, common: bool, marker: Modifier) -> Span<'static> {
+    if common {
+        Span::raw(text)
+    } else {
+        Span::styled(text, Style::default().add_modifier(marker))
+    }
+}
+
 /// Accumulates the rendered lines and, in parallel, the cursor stops
 /// with their jump targets. Blank separators and `was:` continuation
 /// rows are lines but not stops.
@@ -566,13 +667,19 @@ impl LineBuilder {
                 self.stop(Line::from(format!("{pad}- {sig}")).red(), None, expandable);
             }
             ItemStatus::Modified { before } => {
+                // Word-level diff: what changed within the signature is
+                // marked, so the eye needn't compare the two lines.
+                let (before_spans, after_spans) = modified_spans(&before.signature, sig);
+                let mut row = vec![Span::raw(format!("{pad}~ "))];
+                row.extend(after_spans);
                 self.stop(
-                    Line::from(format!("{pad}~ {sig}")).yellow(),
+                    Line::from(row).yellow(),
                     jump_to(view.item.line),
                     expandable,
                 );
-                self.lines
-                    .push(Line::from(format!("{pad}    was: {}", before.signature)).dim());
+                let mut was = vec![Span::raw(format!("{pad}    was: "))];
+                was.extend(before_spans);
+                self.lines.push(Line::from(was).dim());
             }
             ItemStatus::Unchanged => {
                 self.stop(
@@ -1252,6 +1359,57 @@ mod tests {
     fn input_decodes_tab_as_expand() {
         let mut input = InputState::default();
         assert_eq!(input.feed(KeyCode::Tab, false), Some(Motion::Expand));
+    }
+
+    #[test]
+    fn tokenize_keeps_word_runs_whole() {
+        assert_eq!(
+            tokenize("func F(x int)"),
+            vec!["func", " ", "F", "(", "x", " ", "int", ")"]
+        );
+    }
+
+    #[test]
+    fn modified_rows_mark_only_the_changed_tokens() {
+        let rendered = render(&[changed(
+            "a.go",
+            vec![modified(item("B", "func B()"), item("B", "func B(x int)"))],
+        )]);
+        // Row text is unchanged by the span split…
+        assert_eq!(text(&rendered.lines[1]), "  ~ func B(x int)");
+        // …and the inserted parameter is the marked region.
+        let marked: String = rendered.lines[1]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, "x int");
+        // The old side has nothing struck out — nothing was removed.
+        assert!(
+            rendered.lines[2]
+                .spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::CROSSED_OUT))
+        );
+    }
+
+    #[test]
+    fn modified_rows_strike_removed_tokens_on_the_was_line() {
+        let rendered = render(&[changed(
+            "a.go",
+            vec![modified(
+                item("B", "func B(retries int)"),
+                item("B", "func B()"),
+            )],
+        )]);
+        let struck: String = rendered.lines[2]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::CROSSED_OUT))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(struck, "retries int");
     }
 
     /// An index defining `Client` with one field, and a review whose one
