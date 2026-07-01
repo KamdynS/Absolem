@@ -11,12 +11,28 @@
 //! permit at the top level today. Richer disambiguators can extend the
 //! type later without breaking the matching contract.
 
+use std::fmt;
 use std::path::PathBuf;
+
+/// A 1-based source line, counted the way an editor's `+N` flag counts
+/// them. Carried for navigation and serialization; never part of item
+/// identity, and never what makes an item read as modified.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Line(pub(crate) u32);
+
+impl fmt::Display for Line {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Item {
     pub(crate) id: ItemId,
     pub(crate) signature: String,
+    /// Where the item's declaration starts at the ref it was extracted
+    /// from.
+    pub(crate) line: Line,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

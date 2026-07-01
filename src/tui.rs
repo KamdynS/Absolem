@@ -535,6 +535,8 @@ mod tests {
                 name: name.into(),
             },
             signature: sig.into(),
+            // Qualified: `Line` unqualified is ratatui's in this module.
+            line: crate::item::Line(1),
         }
     }
 

@@ -81,7 +81,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::item::{ItemId, Kind};
+    use crate::item::{ItemId, Kind, Line};
 
     fn item(name: &str, kind: Kind, sig: &str) -> Item {
         Item {
@@ -91,6 +91,7 @@ mod tests {
                 name: name.into(),
             },
             signature: sig.into(),
+            line: Line(1),
         }
     }
 
@@ -209,6 +210,7 @@ mod tests {
                 name: "F".into(),
             },
             signature: "func F()".into(),
+            line: Line(1),
         };
         let b = Item {
             id: ItemId {
@@ -217,8 +219,18 @@ mod tests {
                 name: "F".into(),
             },
             signature: "func F()".into(),
+            line: Line(1),
         };
         let cs = diff(&surface(vec![a]), &surface(vec![b]));
         assert_eq!(cs.changes.len(), 2);
+    }
+
+    #[test]
+    fn moving_an_item_without_changing_its_signature_is_not_a_change() {
+        let base = surface(vec![item("A", Kind::Function, "func A()")]);
+        let mut moved = item("A", Kind::Function, "func A()");
+        moved.line = Line(40);
+        let head = surface(vec![moved]);
+        assert!(diff(&base, &head).is_empty());
     }
 }

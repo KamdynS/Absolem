@@ -21,7 +21,7 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
-use crate::item::{Item, ItemId, Kind};
+use crate::item::{Item, ItemId, Kind, Line};
 use crate::producer::{Producer, ProducerError};
 use crate::surface::Surface;
 
@@ -90,6 +90,7 @@ fn push_named(
             name: name.into(),
         },
         signature: signature(node, source, cut),
+        line: start_line(node),
     });
 }
 
@@ -129,8 +130,14 @@ fn extract_impl(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
                 name,
             },
             signature: signature(child, source, body_cut(child)),
+            line: start_line(child),
         });
     }
+}
+
+/// The 1-based line a node's declaration starts on.
+fn start_line(node: Node<'_>) -> Line {
+    Line(u32::try_from(node.start_position().row + 1).unwrap_or(u32::MAX))
 }
 
 fn name_field<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -340,5 +347,14 @@ mod tests {
     #[test]
     fn empty_file_yields_empty_surface() {
         assert!(extract("\n").is_empty());
+    }
+
+    #[test]
+    fn items_carry_their_declaration_line() {
+        let src = "pub struct S;\n\nimpl S {\n    pub fn m(&self) {}\n}\n";
+        let items = extract(src);
+        let lines: Vec<u32> = items.iter().map(|i| i.line.0).collect();
+        // S on line 1; the method on line 4 inside the impl block.
+        assert_eq!(lines, vec![1, 4]);
     }
 }

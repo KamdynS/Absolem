@@ -13,7 +13,7 @@ use std::path::Path;
 
 use tree_sitter::{Node, Parser};
 
-use crate::item::{Item, ItemId, Kind};
+use crate::item::{Item, ItemId, Kind, Line};
 use crate::producer::{Producer, ProducerError};
 use crate::surface::Surface;
 
@@ -56,6 +56,7 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
                         name: name.into(),
                     },
                     signature: signature_without_body(node, source),
+                    line: start_line(node),
                 });
             }
         }
@@ -68,6 +69,7 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
                         name: method_name,
                     },
                     signature: signature_without_body(node, source),
+                    line: start_line(node),
                 });
             }
         }
@@ -87,6 +89,11 @@ fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
         // and `ERROR` nodes. None contribute API shape.
         _ => {}
     }
+}
+
+/// The 1-based line a node's declaration starts on.
+fn start_line(node: Node<'_>) -> Line {
+    Line(u32::try_from(node.start_position().row + 1).unwrap_or(u32::MAX))
 }
 
 fn name_field<'a>(node: Node<'a>, source: &'a str) -> Option<&'a str> {
@@ -156,6 +163,7 @@ fn type_spec_item(spec: Node<'_>, source: &str, path: &Path) -> Option<Item> {
             name: name.into(),
         },
         signature,
+        line: start_line(spec),
     })
 }
 
@@ -192,6 +200,7 @@ fn emit_value_specs(
                 name: name.into(),
             },
             signature: format!("{prefix} {body}"),
+            line: start_line(child),
         });
     }
 }
@@ -341,5 +350,14 @@ mod tests {
     fn empty_file_yields_empty_surface() {
         let items = extract("package foo\n");
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn items_carry_their_declaration_line() {
+        let src = "package foo\n\nfunc A() {}\n\nconst (\n    X = 1\n    Y = 2\n)\n";
+        let items = extract(src);
+        let lines: Vec<u32> = items.iter().map(|i| i.line.0).collect();
+        // A on line 3; X and Y on their own spec lines inside the block.
+        assert_eq!(lines, vec![3, 6, 7]);
     }
 }

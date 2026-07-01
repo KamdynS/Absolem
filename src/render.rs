@@ -51,7 +51,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::item::{Item, ItemId, Kind};
+    use crate::item::{Item, ItemId, Kind, Line};
 
     fn item(name: &str, kind: Kind, sig: &str) -> Item {
         Item {
@@ -61,6 +61,7 @@ mod tests {
                 name: name.into(),
             },
             signature: sig.into(),
+            line: Line(1),
         }
     }
 
