@@ -288,22 +288,23 @@ fn parse_range(raw: &str) -> (Option<&str>, Option<&str>, DiffMode) {
     (side(base), side(head), mode)
 }
 
+/// The remote default branch when one exists, the local one otherwise —
+/// a repo with no remote is still reviewable.
+const DEFAULT_BASES: &[&str] = &["origin/main", "origin/master", "main", "master"];
+
 fn resolve_base(git: &impl GitRepo) -> Result<String> {
-    if git
-        .ref_exists("origin/main")
-        .context("git rev-parse origin/main failed")?
-    {
-        Ok("origin/main".into())
-    } else if git
-        .ref_exists("origin/master")
-        .context("git rev-parse origin/master failed")?
-    {
-        Ok("origin/master".into())
-    } else {
-        Err(anyhow!(
-            "neither origin/main nor origin/master exists in this repo"
-        ))
+    for candidate in DEFAULT_BASES {
+        if git
+            .ref_exists(candidate)
+            .with_context(|| format!("git rev-parse {candidate} failed"))?
+        {
+            return Ok((*candidate).to_owned());
+        }
     }
+    Err(anyhow!(
+        "no default base found (tried {}); pass one explicitly, e.g. `absolem <base>`",
+        DEFAULT_BASES.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -319,6 +320,7 @@ mod tests {
     struct FakeGit {
         main_exists: bool,
         master_exists: bool,
+        local_main_exists: bool,
         files: Vec<ChangedFile>,
         contents: HashMap<String, String>,
     }
@@ -328,6 +330,7 @@ mod tests {
             Ok(match ref_name {
                 "origin/main" => self.main_exists,
                 "origin/master" => self.master_exists,
+                "main" => self.local_main_exists,
                 _ => false,
             })
         }
@@ -381,9 +384,29 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_neither_base_exists() {
+    fn errors_when_no_base_candidate_exists() {
         let git = FakeGit::default();
-        assert!(resolve_base(&git).is_err());
+        let err = resolve_base(&git).unwrap_err().to_string();
+        assert!(err.contains("origin/main"), "error names candidates: {err}");
+    }
+
+    #[test]
+    fn falls_back_to_local_main_when_origin_is_absent() {
+        let git = FakeGit {
+            local_main_exists: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_base(&git).unwrap(), "main");
+    }
+
+    #[test]
+    fn prefers_origin_over_local() {
+        let git = FakeGit {
+            master_exists: true,
+            local_main_exists: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_base(&git).unwrap(), "origin/master");
     }
 
     #[test]
