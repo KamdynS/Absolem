@@ -868,7 +868,9 @@ impl LineBuilder {
     }
 
     /// A resolved definition: its header row (`▸ signature · where`,
-    /// noting contested names), then its members, each expandable.
+    /// noting contested names), collapsed by default — one `Tab` per
+    /// level. Expanding the header reveals its members and then
+    /// whatever the definition itself references.
     fn definition_rows(
         &mut self,
         resolved: &Resolved<'_>,
@@ -889,6 +891,9 @@ impl LineBuilder {
         } else {
             format!("  · {}:{}", def.item.id.path.display(), def.item.line)
         };
+        // The header unfolds members as well as references, so it is
+        // expandable whenever it has either.
+        let expandable = !def.members.is_empty() || can_expand(def, &def_path, ctx.index);
         self.stop(
             Line::from(vec![
                 Span::raw(format!("{pad}▸ {}", def.item.signature)),
@@ -896,23 +901,28 @@ impl LineBuilder {
             ])
             .cyan(),
             Some(jump(def)),
-            can_expand(def, &def_path, ctx.index),
+            expandable,
             has_users(def, &def_path, ctx.index),
             Some(def_path.clone()),
         );
-        self.unfolded(def, indent, &def_path, ctx);
-        for member in &def.members {
-            let member_path = def_path.child(&member.item.id);
-            self.stop(
-                Line::from(format!("{pad}  {}", member.item.signature))
-                    .cyan()
-                    .dim(),
-                Some(jump(member)),
-                can_expand(member, &member_path, ctx.index),
-                has_users(member, &member_path, ctx.index),
-                Some(member_path.clone()),
-            );
-            self.unfolded(member, indent + 2, &member_path, ctx);
+        if ctx.expanded.contains(&def_path) {
+            for member in &def.members {
+                let member_path = def_path.child(&member.item.id);
+                self.stop(
+                    Line::from(format!("{pad}  {}", member.item.signature))
+                        .cyan()
+                        .dim(),
+                    Some(jump(member)),
+                    can_expand(member, &member_path, ctx.index),
+                    has_users(member, &member_path, ctx.index),
+                    Some(member_path.clone()),
+                );
+                self.unfolded(member, indent + 2, &member_path, ctx);
+            }
+            self.expansion(def, indent, &def_path, ctx);
+        }
+        if ctx.usages_open.contains(&def_path) {
+            self.usage_rows(def, indent, &def_path, ctx);
         }
     }
 
@@ -1044,7 +1054,7 @@ pub(crate) fn run(
 }
 
 const HELP: &str =
-    " j/k move · {/} files · / search · n/N matches · ⇥ expand · gr uses · ↵ edit · q quit ";
+    " j/k move · {/} files · / search · n/N matches · ⇥ expand · gr references · ↵ edit · q quit ";
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -1670,15 +1680,29 @@ mod tests {
         app.cursor = 1;
         assert_eq!(app.toggle_expand(), None);
         let texts: Vec<String> = app.lines.iter().map(text).collect();
+        // One Tab, one level: the definition header only, members
+        // collapsed behind their own Tab.
         assert_eq!(texts[2], "      ▸ type Client struct  · f.go:1");
-        assert_eq!(texts[3], "        Client.timeout int");
-        // Unfolded rows are stops in their own right, each with a jump
-        // to the definition site; the cursor stays on its row.
-        assert_eq!(app.stops.len(), 4);
+        assert_eq!(app.lines.len(), 3);
+        assert_eq!(app.stops.len(), 3);
+        // The header row is a stop with a jump of its own; the cursor
+        // stayed on its row.
         assert_eq!(app.cursor, 1);
         assert_eq!(app.jumps[2].as_ref().unwrap().path, PathBuf::from("f.go"));
+        assert!(app.expandable[2]); // it has members to unfold
+
+        // Tab on the header unfolds the members.
+        app.cursor = 2;
+        assert_eq!(app.toggle_expand(), None);
+        let texts: Vec<String> = app.lines.iter().map(text).collect();
+        assert_eq!(texts[3], "        Client.timeout int");
+        assert_eq!(app.stops.len(), 4);
         assert_eq!(app.jumps[3].as_ref().unwrap().path, PathBuf::from("f.go"));
 
+        // Collapse both levels again.
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(app.stops.len(), 3);
+        app.cursor = 1;
         assert_eq!(app.toggle_expand(), None);
         assert_eq!(app.lines.len(), 2);
         assert_eq!(app.stops.len(), 2);
