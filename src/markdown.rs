@@ -1,6 +1,6 @@
 //! The markdown frontend: renders a review as forge-flavored markdown
-//! for a CI pipeline comment (DESIGN §2's third frontend). Pure — takes
-//! `&mut impl Write` like the other text frontends.
+//! for a CI pipeline comment. Pure — takes `&mut impl Write` like the
+//! other text frontends.
 //!
 //! Each file is a bold heading over a diff-language code fence, so
 //! GitHub/GitLab color added lines green and removed lines red. A

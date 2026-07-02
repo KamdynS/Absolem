@@ -116,6 +116,9 @@ impl Producer for RustProducer {
 }
 
 fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
+    // Node kinds are strings defined by the vendored grammar; the
+    // tree-sitter bindings generate no Rust enum for them, so string
+    // matching is the supported dispatch form.
     match node.kind() {
         "function_item" => push_named(node, source, path, Kind::Function, body_cut(node), out),
         "struct_item" => {

@@ -30,10 +30,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView, TypeIndex};
 use crate::item::Line as SourceLine;
 
-/// The authority to open the user's editor at a location. A capability
-/// (STYLE §3): the TUI cannot spawn a process any other way, and tests
-/// hand in a recording fake. Only the composition root constructs the
-/// real, `$EDITOR`-backed implementation.
+/// The authority to open the user's editor at a location. The TUI can
+/// spawn a process no other way: only the composition root constructs
+/// the real, `$EDITOR`-backed implementation, and tests substitute an
+/// in-memory fake.
 pub(crate) trait EditorLauncher {
     fn open(&self, path: &Path, line: SourceLine) -> io::Result<()>;
 }

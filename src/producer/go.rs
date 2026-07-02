@@ -118,6 +118,9 @@ impl Producer for GoProducer {
 }
 
 fn extract_into(node: Node<'_>, source: &str, path: &Path, out: &mut Surface) {
+    // Node kinds are strings defined by the vendored grammar; the
+    // tree-sitter bindings generate no Rust enum for them, so string
+    // matching is the supported dispatch form.
     match node.kind() {
         "function_declaration" => {
             if let Some(name) = name_field(node, source) {
