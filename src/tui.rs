@@ -27,8 +27,8 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView, TypeIndex};
-use crate::item::Line as SourceLine;
+use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView, Resolved, TypeIndex};
+use crate::item::{ItemId, Line as SourceLine};
 
 /// The authority to open the user's editor at a location. The TUI can
 /// spawn a process no other way: only the composition root constructs
@@ -47,6 +47,26 @@ struct JumpTarget {
     line: SourceLine,
 }
 
+/// The stable identity of an item row: the chain of `ItemId`s from the
+/// review row down through each expansion that produced it. Expansion
+/// state is keyed by this rather than by stop position — positions
+/// shift whenever rows unfold, identities don't. Doubles as the cycle
+/// guard: a definition already on the path is not expanded again.
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
+struct RowPath(Vec<ItemId>);
+
+impl RowPath {
+    fn child(&self, id: &ItemId) -> Self {
+        let mut ids = self.0.clone();
+        ids.push(id.clone());
+        Self(ids)
+    }
+
+    fn contains(&self, id: &ItemId) -> bool {
+        self.0.contains(id)
+    }
+}
+
 /// A review turned into display lines plus the indices of the lines the
 /// cursor may land on. Blank separators and `was:` continuation rows are
 /// rendered but are not stops.
@@ -58,6 +78,11 @@ struct Rendered {
     /// Parallel to `stops`: whether the row references a type the index
     /// can resolve, i.e. whether `Tab` will do anything.
     expandable: Vec<bool>,
+    /// Parallel to `stops`: whether anything references the row's item,
+    /// i.e. whether `gr` will do anything.
+    referenced: Vec<bool>,
+    /// Parallel to `stops`: the row's identity, `None` for file headers.
+    paths: Vec<Option<RowPath>>,
     /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
     headers: Vec<usize>,
 }
@@ -92,6 +117,8 @@ enum Motion {
     NextFile(usize),
     /// `Tab` — expand or collapse the types the cursor's item references.
     Expand,
+    /// `gr` — show or hide what references the cursor's item.
+    Usages,
     /// `Enter` — open the cursor's item in the user's editor.
     Open,
     Quit,
@@ -173,6 +200,13 @@ impl InputState {
             return None;
         }
 
+        // `gr`: the one non-`gg` completion of a pending `g`.
+        if self.pending_g && !ctrl && code == KeyCode::Char('r') {
+            self.pending_g = false;
+            self.count = None;
+            return Some(Motion::Usages);
+        }
+
         // Any other key ends a dangling `g` and consumes the pending count.
         self.pending_g = false;
         let count = self.count.take();
@@ -211,8 +245,11 @@ struct App {
     review: Vec<FileChange>,
     /// The head-wide index expansions resolve against.
     index: TypeIndex,
-    /// Stop indices whose expansion is currently open.
-    expanded: HashSet<usize>,
+    /// Rows whose expansion is currently open, by identity — positions
+    /// shift as rows unfold, identities don't.
+    expanded: HashSet<RowPath>,
+    /// Rows whose used-by list is currently open, same keying.
+    usages_open: HashSet<RowPath>,
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
     /// Parallel to `stops`: where each stop jumps when opened.
@@ -220,6 +257,10 @@ struct App {
     /// Parallel to `stops`: whether the row has at least one reference
     /// that resolves in the index.
     expandable: Vec<bool>,
+    /// Parallel to `stops`: whether anything references the row's item.
+    referenced: Vec<bool>,
+    /// Parallel to `stops`: the row's identity, `None` for file headers.
+    paths: Vec<Option<RowPath>>,
     /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
     headers: Vec<usize>,
     /// Stop indices whose row matched the last committed search.
@@ -237,10 +278,13 @@ impl App {
             review: review.to_vec(),
             index,
             expanded: HashSet::new(),
+            usages_open: HashSet::new(),
             lines: Vec::new(),
             stops: Vec::new(),
             jumps: Vec::new(),
             expandable: Vec::new(),
+            referenced: Vec::new(),
+            paths: Vec::new(),
             headers: Vec::new(),
             matches: Vec::new(),
             summary: summarize(review),
@@ -253,21 +297,41 @@ impl App {
     }
 
     /// Rebuilds the display lines from the review and the current
-    /// expansion state. Stops are stable across toggles (expansion rows
-    /// are not stops), so the cursor keeps its position.
+    /// expansion state, then puts the cursor back on the row it was on:
+    /// rows are found again by identity, since unfolding shifts every
+    /// position below it.
     fn rerender(&mut self) {
+        let on = self.paths.get(self.cursor).cloned().flatten();
         let Rendered {
             lines,
             stops,
             jumps,
             expandable,
+            referenced,
+            paths,
             headers,
-        } = render_lines(&self.review, &self.expanded, &self.index);
+        } = render_lines(
+            &self.review,
+            &RenderCtx {
+                expanded: &self.expanded,
+                usages_open: &self.usages_open,
+                index: &self.index,
+            },
+        );
         self.lines = lines;
         self.stops = stops;
         self.jumps = jumps;
         self.expandable = expandable;
+        self.referenced = referenced;
+        self.paths = paths;
         self.headers = headers;
+        if let Some(on) = on
+            && let Some(found) = self.paths.iter().position(|p| p.as_ref() == Some(&on))
+        {
+            self.cursor = found;
+        } else if !self.stops.is_empty() {
+            self.cursor = self.cursor.min(self.stops.len() - 1);
+        }
         self.scroll_to_cursor();
     }
 
@@ -277,8 +341,27 @@ impl App {
         if !self.expandable.get(self.cursor).copied().unwrap_or(false) {
             return Some(" nothing to expand here ".to_owned());
         }
-        if !self.expanded.remove(&self.cursor) {
-            self.expanded.insert(self.cursor);
+        let Some(path) = self.paths.get(self.cursor).cloned().flatten() else {
+            return Some(" nothing to expand here ".to_owned());
+        };
+        if !self.expanded.remove(&path) {
+            self.expanded.insert(path);
+        }
+        self.rerender();
+        None
+    }
+
+    /// `gr`: toggles the cursor row's used-by list. Returns a footer
+    /// notice when nothing references the item.
+    fn toggle_usages(&mut self) -> Option<String> {
+        if !self.referenced.get(self.cursor).copied().unwrap_or(false) {
+            return Some(" nothing references this item ".to_owned());
+        }
+        let Some(path) = self.paths.get(self.cursor).cloned().flatten() else {
+            return Some(" nothing references this item ".to_owned());
+        };
+        if !self.usages_open.remove(&path) {
+            self.usages_open.insert(path);
         }
         self.rerender();
         None
@@ -329,9 +412,9 @@ impl App {
             Motion::PrevMatch => self.prev_match(),
             Motion::PrevFile(n) => self.prev_file(n),
             Motion::NextFile(n) => self.next_file(n),
-            // Expand, Open, and Quit are handled by the event loop: they
-            // either re-render or act on the world outside the pane.
-            Motion::Expand | Motion::Open | Motion::Quit => {}
+            // Unfolds, Open, and Quit are handled by the event loop:
+            // they either re-render or act outside the pane.
+            Motion::Expand | Motion::Usages | Motion::Open | Motion::Quit => {}
         }
     }
 
@@ -621,50 +704,119 @@ struct LineBuilder {
     stops: Vec<u16>,
     jumps: Vec<Option<JumpTarget>>,
     expandable: Vec<bool>,
+    referenced: Vec<bool>,
+    paths: Vec<Option<RowPath>>,
     headers: Vec<usize>,
 }
 
+/// Where an item's row jumps: its declaration site, straight off the
+/// item itself.
+fn jump(view: &ItemView) -> JumpTarget {
+    JumpTarget {
+        path: view.item.id.path.clone(),
+        line: view.item.line,
+    }
+}
+
+/// Whether `Tab` on this row would unfold anything: at least one of its
+/// references resolves to a definition not already on the row's path
+/// (expanding a cycle would loop forever).
+fn can_expand(view: &ItemView, path: &RowPath, index: &TypeIndex) -> bool {
+    view.item.refs.iter().any(|r| {
+        index
+            .lookup(&r.0, &view.item.id.path)
+            .is_some_and(|res| !path.contains(&res.def.item.id))
+    })
+}
+
+/// Whether `gr` on this row would unfold anything: something other than
+/// the item itself (or a row already on the path) references its name.
+fn has_users(view: &ItemView, path: &RowPath, index: &TypeIndex) -> bool {
+    index
+        .users_of(&view.item.id.name)
+        .iter()
+        .any(|u| u.item.id != view.item.id && !path.contains(&u.item.id))
+}
+
+/// What the row builders consult: which rows are unfolded in each
+/// direction, and the index that resolves both.
+struct RenderCtx<'a> {
+    expanded: &'a HashSet<RowPath>,
+    usages_open: &'a HashSet<RowPath>,
+    index: &'a TypeIndex,
+}
+
 impl LineBuilder {
+    fn into_rendered(self) -> Rendered {
+        Rendered {
+            lines: self.lines,
+            stops: self.stops,
+            jumps: self.jumps,
+            expandable: self.expandable,
+            referenced: self.referenced,
+            paths: self.paths,
+            headers: self.headers,
+        }
+    }
+
     /// Pushes a line the cursor can land on.
-    fn stop(&mut self, line: Line<'static>, jump: Option<JumpTarget>, expandable: bool) {
+    fn stop(
+        &mut self,
+        line: Line<'static>,
+        jump: Option<JumpTarget>,
+        expandable: bool,
+        referenced: bool,
+        path: Option<RowPath>,
+    ) {
         self.stops
             .push(u16::try_from(self.lines.len()).unwrap_or(u16::MAX));
         self.jumps.push(jump);
         self.expandable.push(expandable);
+        self.referenced.push(referenced);
+        self.paths.push(path);
         self.lines.push(line);
     }
 
-    /// One item row at `indent`: status marker and color by status,
+    /// Whatever the row's toggles have unfolded, rendered beneath it:
+    /// referenced definitions (`Tab`) and referencing items (`gr`).
+    fn unfolded(&mut self, view: &ItemView, indent: usize, row_path: &RowPath, ctx: &RenderCtx) {
+        if ctx.expanded.contains(row_path) {
+            self.expansion(view, indent, row_path, ctx);
+        }
+        if ctx.usages_open.contains(row_path) {
+            self.usage_rows(view, indent, row_path, ctx);
+        }
+    }
+
+    /// One review row at `indent`: status marker and color by status,
     /// unchanged context dimmed, a modified row's old signature beneath,
-    /// and — when the row's stop is in `expanded` — the definitions of
-    /// the types it references, indented below.
-    fn item_row(
-        &mut self,
-        view: &ItemView,
-        indent: usize,
-        path: &std::path::Path,
-        expanded: &HashSet<usize>,
-        index: &TypeIndex,
-    ) {
+    /// and whatever the row has unfolded below it.
+    fn item_row(&mut self, view: &ItemView, indent: usize, parent: &RowPath, ctx: &RenderCtx) {
         let pad = " ".repeat(indent);
         let sig = &view.item.signature;
-        let jump_to = |line: SourceLine| {
-            Some(JumpTarget {
-                path: path.to_path_buf(),
-                line,
-            })
-        };
-        let expandable = view.item.refs.iter().any(|r| index.lookup(&r.0).is_some());
+        let row_path = parent.child(&view.item.id);
+        let expandable = can_expand(view, &row_path, ctx.index);
+        let referenced = has_users(view, &row_path, ctx.index);
         match &view.status {
             ItemStatus::Added => {
                 self.stop(
                     Line::from(format!("{pad}+ {sig}")).green(),
-                    jump_to(view.item.line),
+                    Some(jump(view)),
                     expandable,
+                    referenced,
+                    Some(row_path.clone()),
                 );
             }
             ItemStatus::Removed => {
-                self.stop(Line::from(format!("{pad}- {sig}")).red(), None, expandable);
+                // A removed item no longer exists on the head side:
+                // nowhere to jump.
+                self.stop(
+                    Line::from(format!("{pad}- {sig}")).red(),
+                    None,
+                    expandable,
+                    referenced,
+                    Some(row_path.clone()),
+                );
             }
             ItemStatus::Modified { before } => {
                 // Word-level diff: what changed within the signature is
@@ -674,8 +826,10 @@ impl LineBuilder {
                 row.extend(after_spans);
                 self.stop(
                     Line::from(row).yellow(),
-                    jump_to(view.item.line),
+                    Some(jump(view)),
                     expandable,
+                    referenced,
+                    Some(row_path.clone()),
                 );
                 let mut was = vec![Span::raw(format!("{pad}    was: "))];
                 was.extend(before_spans);
@@ -684,40 +838,118 @@ impl LineBuilder {
             ItemStatus::Unchanged => {
                 self.stop(
                     Line::from(format!("{pad}  {sig}")).dim(),
-                    jump_to(view.item.line),
+                    Some(jump(view)),
                     expandable,
+                    referenced,
+                    Some(row_path.clone()),
                 );
             }
         }
-        if expanded.contains(&(self.stops.len() - 1)) {
-            self.expansion(view, indent, index);
+        self.unfolded(view, indent, &row_path, ctx);
+    }
+
+    /// The definitions of the types `view` references, unfolded beneath
+    /// its row. Every unfolded row is a real stop — jumpable,
+    /// searchable, and expandable in turn; a reference back to a type
+    /// already on the path renders as a cycle note instead of looping.
+    fn expansion(&mut self, view: &ItemView, indent: usize, row_path: &RowPath, ctx: &RenderCtx) {
+        let pad = " ".repeat(indent + 4);
+        for r in &view.item.refs {
+            let Some(resolved) = ctx.index.lookup(&r.0, &view.item.id.path) else {
+                continue;
+            };
+            if row_path.contains(&resolved.def.item.id) {
+                self.lines
+                    .push(Line::from(format!("{pad}↺ {} (cycle)", r.0)).cyan().dim());
+                continue;
+            }
+            self.definition_rows(&resolved, indent + 4, row_path, ctx);
         }
     }
 
-    /// The definitions of the types `view` references, as non-stop
-    /// context lines: each resolved ref renders its signature, where it
-    /// lives, and its members.
-    fn expansion(&mut self, view: &ItemView, indent: usize, index: &TypeIndex) {
-        let pad = " ".repeat(indent + 4);
-        for r in &view.item.refs {
-            let Some(def) = index.lookup(&r.0) else {
-                continue;
-            };
-            let at = format!("  · {}:{}", def.item.id.path.display(), def.item.line);
-            self.lines.push(
-                Line::from(vec![
-                    Span::raw(format!("{pad}▸ {}", def.item.signature)),
-                    Span::raw(at).dim(),
-                ])
-                .cyan(),
-            );
+    /// A resolved definition: its header row (`▸ signature · where`,
+    /// noting contested names), collapsed by default — one `Tab` per
+    /// level. Expanding the header reveals its members and then
+    /// whatever the definition itself references.
+    fn definition_rows(
+        &mut self,
+        resolved: &Resolved<'_>,
+        indent: usize,
+        parent: &RowPath,
+        ctx: &RenderCtx,
+    ) {
+        let def = resolved.def;
+        let pad = " ".repeat(indent);
+        let def_path = parent.child(&def.item.id);
+        let at = if resolved.candidates > 1 {
+            format!(
+                "  · {}:{} (1 of {} definitions)",
+                def.item.id.path.display(),
+                def.item.line,
+                resolved.candidates
+            )
+        } else {
+            format!("  · {}:{}", def.item.id.path.display(), def.item.line)
+        };
+        // The header unfolds members as well as references, so it is
+        // expandable whenever it has either.
+        let expandable = !def.members.is_empty() || can_expand(def, &def_path, ctx.index);
+        self.stop(
+            Line::from(vec![
+                Span::raw(format!("{pad}▸ {}", def.item.signature)),
+                Span::raw(at).dim(),
+            ])
+            .cyan(),
+            Some(jump(def)),
+            expandable,
+            has_users(def, &def_path, ctx.index),
+            Some(def_path.clone()),
+        );
+        if ctx.expanded.contains(&def_path) {
             for member in &def.members {
-                self.lines.push(
-                    Line::from(format!("{pad}      {}", member.item.signature))
+                let member_path = def_path.child(&member.item.id);
+                self.stop(
+                    Line::from(format!("{pad}  {}", member.item.signature))
                         .cyan()
                         .dim(),
+                    Some(jump(member)),
+                    can_expand(member, &member_path, ctx.index),
+                    has_users(member, &member_path, ctx.index),
+                    Some(member_path.clone()),
                 );
+                self.unfolded(member, indent + 2, &member_path, ctx);
             }
+            self.expansion(def, indent, &def_path, ctx);
+        }
+        if ctx.usages_open.contains(&def_path) {
+            self.usage_rows(def, indent, &def_path, ctx);
+        }
+    }
+
+    /// The items whose signatures reference `view`'s item — the reverse
+    /// direction — unfolded beneath its row. Same contract as expansion
+    /// rows: each is a stop, jumpable and unfoldable in turn, with the
+    /// row path as the cycle guard.
+    fn usage_rows(&mut self, view: &ItemView, indent: usize, row_path: &RowPath, ctx: &RenderCtx) {
+        let pad = " ".repeat(indent + 4);
+        for user in ctx.index.users_of(&view.item.id.name) {
+            if user.item.id == view.item.id || row_path.contains(&user.item.id) {
+                continue;
+            }
+            let user_path = row_path.child(&user.item.id);
+            let at = format!("  · {}:{}", user.item.id.path.display(), user.item.line);
+            self.stop(
+                Line::from(vec![
+                    Span::raw(format!("{pad}◂ {}", user.item.signature)),
+                    Span::raw(at).dim(),
+                ])
+                .magenta(),
+                Some(jump(user)),
+                can_expand(user, &user_path, ctx.index),
+                has_users(user, &user_path, ctx.index),
+                Some(user_path.clone()),
+            );
+            self.unfolded(user, indent + 4, &user_path, ctx);
         }
     }
 }
@@ -728,18 +960,12 @@ impl LineBuilder {
 /// off as paragraphs, files separated by a blank line. Every item row is
 /// a stop (unchanged context included — it can still be expanded or
 /// jumped to); removed rows and deleted files have nowhere to go.
-fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIndex) -> Rendered {
+fn render_lines(review: &[FileChange], ctx: &RenderCtx) -> Rendered {
     let mut b = LineBuilder::default();
     if review.is_empty() {
         b.lines
             .push(Line::from("No structural changes — the API surface is untouched.").dim());
-        return Rendered {
-            lines: b.lines,
-            stops: b.stops,
-            jumps: b.jumps,
-            expandable: b.expandable,
-            headers: b.headers,
-        };
+        return b.into_rendered();
     }
     for (i, file) in review.iter().enumerate() {
         if i > 0 {
@@ -754,6 +980,8 @@ fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIn
                         .bold(),
                     None,
                     false,
+                    false,
+                    None,
                 );
             }
             FileChangeKind::Changed(changeset) => {
@@ -764,29 +992,26 @@ fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIn
                         line: SourceLine(1),
                     }),
                     false,
+                    false,
+                    None,
                 );
+                let root = RowPath::default();
                 let mut prev_was_composite = false;
                 for block in &changeset.blocks {
                     let composite = !block.members.is_empty();
                     if composite || prev_was_composite {
                         b.lines.push(Line::default());
                     }
-                    b.item_row(block, 2, &file.path, expanded, index);
+                    b.item_row(block, 2, &root, ctx);
                     for member in &block.members {
-                        b.item_row(member, 6, &file.path, expanded, index);
+                        b.item_row(member, 6, &root, ctx);
                     }
                     prev_was_composite = composite;
                 }
             }
         }
     }
-    Rendered {
-        lines: b.lines,
-        stops: b.stops,
-        jumps: b.jumps,
-        expandable: b.expandable,
-        headers: b.headers,
-    }
+    b.into_rendered()
 }
 
 /// The title-bar summary: `5 files · +12 ~3 -4`, with deleted files
@@ -828,7 +1053,8 @@ pub(crate) fn run(
     result
 }
 
-const HELP: &str = " j/k move · {/} files · / search · n/N matches · ⇥ expand · ↵ edit · q quit ";
+const HELP: &str =
+    " j/k move · {/} files · / search · n/N matches · ⇥ expand · gr references · ↵ edit · q quit ";
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -878,6 +1104,7 @@ fn event_loop(
                         Motion::Quit => return Ok(()),
                         Motion::Open => notice = open_in_editor(terminal, app, editor)?,
                         Motion::Expand => notice = app.toggle_expand(),
+                        Motion::Usages => notice = app.toggle_usages(),
                         _ => app.apply(motion),
                     }
                 }
@@ -1007,7 +1234,16 @@ mod tests {
 
     /// `render_lines` with no expansions and an empty index.
     fn render(review: &[FileChange]) -> Rendered {
-        render_lines(review, &HashSet::new(), &TypeIndex::default())
+        let (expanded, usages_open) = (HashSet::new(), HashSet::new());
+        let index = TypeIndex::default();
+        render_lines(
+            review,
+            &RenderCtx {
+                expanded: &expanded,
+                usages_open: &usages_open,
+                index: &index,
+            },
+        )
     }
 
     /// Three added items in one file: 1 header + 3 change rows = 4 stops over
@@ -1444,14 +1680,143 @@ mod tests {
         app.cursor = 1;
         assert_eq!(app.toggle_expand(), None);
         let texts: Vec<String> = app.lines.iter().map(text).collect();
+        // One Tab, one level: the definition header only, members
+        // collapsed behind their own Tab.
         assert_eq!(texts[2], "      ▸ type Client struct  · f.go:1");
-        assert_eq!(texts[3], "            Client.timeout int");
-        // Expansion rows are not stops; the cursor's stop is unchanged.
-        assert_eq!(app.stops.len(), 2);
+        assert_eq!(app.lines.len(), 3);
+        assert_eq!(app.stops.len(), 3);
+        // The header row is a stop with a jump of its own; the cursor
+        // stayed on its row.
         assert_eq!(app.cursor, 1);
+        assert_eq!(app.jumps[2].as_ref().unwrap().path, PathBuf::from("f.go"));
+        assert!(app.expandable[2]); // it has members to unfold
 
+        // Tab on the header unfolds the members.
+        app.cursor = 2;
+        assert_eq!(app.toggle_expand(), None);
+        let texts: Vec<String> = app.lines.iter().map(text).collect();
+        assert_eq!(texts[3], "        Client.timeout int");
+        assert_eq!(app.stops.len(), 4);
+        assert_eq!(app.jumps[3].as_ref().unwrap().path, PathBuf::from("f.go"));
+
+        // Collapse both levels again.
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(app.stops.len(), 3);
+        app.cursor = 1;
         assert_eq!(app.toggle_expand(), None);
         assert_eq!(app.lines.len(), 2);
+        assert_eq!(app.stops.len(), 2);
+    }
+
+    #[test]
+    fn expansion_recurses_and_guards_cycles() {
+        // Node refs Edge; Edge refs Node (a cycle) and Weight (not).
+        let mut node = item("Node", "type Node struct");
+        node.id.kind = Kind::Struct;
+        node.refs = vec![crate::item::TypeRef("Edge".into())];
+        let mut edge = item("Edge", "type Edge struct");
+        edge.id.kind = Kind::Struct;
+        edge.refs = vec![
+            crate::item::TypeRef("Node".into()),
+            crate::item::TypeRef("Weight".into()),
+        ];
+        let mut weight = item("Weight", "type Weight float64");
+        weight.id.kind = Kind::Type;
+        let mut s = crate::surface::Surface::new();
+        s.push(node);
+        s.push(edge);
+        s.push(weight);
+        let index = TypeIndex::build(&[s]);
+
+        let mut f = item("Walk", "func Walk(n Node)");
+        f.refs = vec![crate::item::TypeRef("Node".into())];
+        let mut app = App::new(&[changed("a.go", vec![added(f)])], index);
+        app.viewport_height = 30;
+
+        // Expand the review row: Node's definition unfolds.
+        app.cursor = 1;
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(text(&app.lines[2]), "      ▸ type Node struct  · f.go:1");
+        // The unfolded Node row is itself expandable (it refs Edge).
+        app.cursor = 2;
+        assert!(app.expandable[2]);
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(
+            text(&app.lines[3]),
+            "          ▸ type Edge struct  · f.go:1"
+        );
+        // Expanding Edge: the ref back to Node is already on this row's
+        // path, so it renders as a cycle note; Weight unfolds normally.
+        app.cursor = 3;
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(text(&app.lines[4]), "              ↺ Node (cycle)");
+        assert_eq!(
+            text(&app.lines[5]),
+            "              ▸ type Weight float64  · f.go:1"
+        );
+        // The cursor stayed on the Edge row through the re-render.
+        assert_eq!(app.cursor, 3);
+        // The Weight row's only surroundings are cyclic or ref-free: it
+        // has no refs of its own, so it is not expandable.
+        assert!(!app.expandable[4]);
+    }
+
+    #[test]
+    fn input_decodes_gr_as_usages_and_keeps_gg_working() {
+        let mut input = InputState::default();
+        assert_eq!(input.feed(KeyCode::Char('g'), false), None);
+        assert_eq!(input.feed(KeyCode::Char('r'), false), Some(Motion::Usages));
+        assert_eq!(input.feed(KeyCode::Char('g'), false), None);
+        assert_eq!(
+            input.feed(KeyCode::Char('g'), false),
+            Some(Motion::First(None))
+        );
+    }
+
+    #[test]
+    fn gr_unfolds_the_used_by_list_and_collapses_again() {
+        // The index knows Client and a function referencing it; the
+        // review shows Client itself.
+        let mut client = item("Client", "type Client struct");
+        client.id.kind = Kind::Struct;
+        let mut connect = item("Connect", "func Connect() *Client");
+        connect.refs = vec![crate::item::TypeRef("Client".into())];
+        let mut s = crate::surface::Surface::new();
+        s.push(client.clone());
+        s.push(connect);
+        let index = TypeIndex::build(&[s]);
+
+        let mut app = App::new(
+            &[changed(
+                "a.go",
+                vec![modified(item("Client", "type Client struct"), client)],
+            )],
+            index,
+        );
+        app.viewport_height = 20;
+
+        app.cursor = 1;
+        assert!(app.referenced[1]);
+        assert_eq!(app.toggle_usages(), None);
+        // Row 0 header, 1 the ~ row, 2 its was: line, 3 the user.
+        assert_eq!(
+            text(&app.lines[3]),
+            "      ◂ func Connect() *Client  · f.go:1"
+        );
+        // The usage row is a stop with a jump of its own.
+        assert_eq!(app.stops.len(), 3);
+        assert_eq!(app.jumps[2].as_ref().unwrap().path, PathBuf::from("f.go"));
+
+        assert_eq!(app.toggle_usages(), None);
+        assert_eq!(app.stops.len(), 2);
+    }
+
+    #[test]
+    fn gr_on_an_unreferenced_row_notices() {
+        let mut app = expandable_app();
+        app.viewport_height = 20;
+        app.cursor = 1; // Connect: nothing references a function's name
+        assert!(app.toggle_usages().is_some());
     }
 
     #[test]
@@ -1510,7 +1875,8 @@ mod tests {
         app.viewport_height = 10;
         assert_eq!(app.current_jump().unwrap().line, crate::item::Line(1));
         app.cursor_down(1);
-        assert_eq!(app.current_jump().unwrap().path, PathBuf::from("a.go"));
+        // Item rows jump to the item's own declaration site.
+        assert_eq!(app.current_jump().unwrap().path, PathBuf::from("f.go"));
     }
 
     #[test]

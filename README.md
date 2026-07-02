@@ -44,11 +44,14 @@ position, `/` search with `n`/`N`, `q` quits. Colors are ANSI palette
 entries, so the view takes on your terminal's theme; modified rows mark
 exactly the tokens that changed.
 
-`Tab` expands the types the current row references — the definition and
-members of a signature's parameter or return types unfold inline,
-resolved by name against the whole tree at head. (One level deep for
-now: expanded rows are context only and can't themselves be expanded or
-jumped into.) `Enter` opens the item
+`Tab` expands the types the current row references — one level per
+press: first the definition header, another `Tab` on it for its
+members, and so on down (cycles are guarded), resolved by name against
+the whole tree at head. Unfolded rows are first-class: cursor onto
+them, `Enter` to open one at its declaration. `gr` shows references —
+every item whose signature mentions the current type unfolds as a
+jumpable list. When a name has competing definitions the header says so
+("1 of 3 definitions") rather than guessing silently. `Enter` opens the item
 at its line in `$VISUAL`/`$EDITOR` (strictly those; if neither is set,
 absolem tells you rather than guessing an editor).
 

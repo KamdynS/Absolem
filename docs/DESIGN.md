@@ -138,14 +138,14 @@ Landed so far:
 - Member-level grouping with context: a changed composite renders whole,
   unchanged members dimmed, so the diff reads like the type it changed.
 
+- The reference graph is navigable: expansion rows are first-class
+  (identity-keyed, recursive, cycle-guarded, jumpable), `gr` inverts the
+  edge to answer *what uses this type*, and name resolution keeps every
+  colliding definition, preferring the referencing file and reporting
+  the contest instead of guessing silently.
+
 Next:
 
-- First-class expansion rows in the TUI. Today `Tab`-expanded types are
-  one level deep and render as context only — the cursor cannot land on
-  them, so they can't be expanded further, jumped into, or searched.
-  Fixing this means keying expansion state by item identity (a path of
-  `ItemId`s) instead of stop index, and guarding recursive expansion
-  against reference cycles. TUI-layer only; no boundary moves.
 - Go goes semantic via gopls: resolved `TypeRef` edges, real
   jump-to-definition / find-references from the TUI.
 - The Neovim plugin consuming the JSON IR.

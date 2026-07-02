@@ -16,7 +16,7 @@
 //! tree-sitter.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::item::Item;
 use crate::surface::Surface;
@@ -101,48 +101,110 @@ pub(crate) enum FileChangeKind {
     Changed(ChangeSet),
 }
 
+/// A resolved type reference: the definition chosen, and how contested
+/// its name is. `candidates` of one means the name is unambiguous;
+/// anything higher means resolution had to guess and frontends should
+/// say so.
+#[derive(Debug)]
+pub(crate) struct Resolved<'a> {
+    pub(crate) def: &'a ItemView,
+    pub(crate) candidates: usize,
+}
+
 /// A head-wide index of item definitions by name, for resolving
 /// `TypeRef`s: exact name match, with a fallback to the final segment
 /// of a qualified name (`pkg.Client` → `Client`). Members attach to
 /// their parent's entry across files, so an `impl` in another file
-/// lands on the type it extends. Resolution is purely name-based and
-/// first-definition-wins: when names collide across packages it can
-/// pick the wrong type.
+/// lands on the type it extends. Every definition of a colliding name
+/// is kept; resolution prefers one in the referencing item's own file,
+/// then falls back to the first seen.
 #[derive(Debug, Default)]
 pub(crate) struct TypeIndex {
-    by_name: HashMap<String, ItemView>,
+    by_name: HashMap<String, Vec<ItemView>>,
+    /// The inverse edge: type name → every item whose signature
+    /// references it. Keyed by the final segment of the reference as
+    /// written, matching how `lookup` normalizes.
+    users: HashMap<String, Vec<ItemView>>,
 }
 
 impl TypeIndex {
     pub(crate) fn build(surfaces: &[Surface]) -> Self {
-        let mut by_name: HashMap<String, ItemView> = HashMap::new();
+        let mut by_name: HashMap<String, Vec<ItemView>> = HashMap::new();
         for surface in surfaces {
             for item in surface.iter().filter(|i| i.parent.is_none()) {
                 by_name
                     .entry(item.id.name.clone())
-                    .or_insert_with(|| ItemView::leaf(ItemStatus::Unchanged, item.clone()));
+                    .or_default()
+                    .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
             }
         }
         for surface in surfaces {
             for item in surface.iter() {
-                if let Some(parent) = &item.parent
-                    && let Some(block) = by_name.get_mut(parent)
-                {
-                    block
-                        .members
+                let Some(parent) = &item.parent else {
+                    continue;
+                };
+                let Some(defs) = by_name.get_mut(parent) else {
+                    continue;
+                };
+                // A member joins the definition in its own file when one
+                // exists — an impl block next to its type — and the
+                // first definition otherwise.
+                let at = defs
+                    .iter()
+                    .position(|d| d.item.id.path == item.id.path)
+                    .unwrap_or(0);
+                defs[at]
+                    .members
+                    .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
+            }
+        }
+        let mut users: HashMap<String, Vec<ItemView>> = HashMap::new();
+        for surface in surfaces {
+            for item in surface.iter() {
+                for reference in &item.refs {
+                    let name = final_segment(&reference.0);
+                    users
+                        .entry(name.to_owned())
+                        .or_default()
                         .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
                 }
             }
         }
-        Self { by_name }
+        Self { by_name, users }
     }
 
-    pub(crate) fn lookup(&self, name: &str) -> Option<&ItemView> {
+    /// Every item whose signature references `name` — the reverse of
+    /// `lookup`. Name-based, like everything at this tier: two types
+    /// sharing a name share a user list.
+    pub(crate) fn users_of(&self, name: &str) -> &[ItemView] {
+        self.users.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Resolves `name` as seen from `from` (the referencing item's
+    /// file): a definition in the same file wins over one elsewhere.
+    pub(crate) fn lookup(&self, name: &str, from: &Path) -> Option<Resolved<'_>> {
+        let defs = self.candidates(name)?;
+        let def = defs
+            .iter()
+            .find(|d| d.item.id.path == from)
+            .unwrap_or(defs.first()?);
+        Some(Resolved {
+            def,
+            candidates: defs.len(),
+        })
+    }
+
+    fn candidates(&self, name: &str) -> Option<&Vec<ItemView>> {
         self.by_name.get(name).or_else(|| {
-            let last = name.rsplit(['.', ':']).next()?;
+            let last = final_segment(name);
             (last != name).then(|| self.by_name.get(last))?
         })
     }
+}
+
+/// `pkg.Client` → `Client`, `Foo::Bar` → `Bar`; a bare name unchanged.
+fn final_segment(name: &str) -> &str {
+    name.rsplit(['.', ':']).next().unwrap_or(name)
 }
 
 pub(crate) fn diff(base: &Surface, head: &Surface) -> ChangeSet {
@@ -437,17 +499,59 @@ mod tests {
         method.id.path = PathBuf::from("client_ext.go");
 
         let index = TypeIndex::build(&[surface(vec![client, field]), surface(vec![method])]);
-        let block = index.lookup("Client").unwrap();
-        assert_eq!(block.item.id.name, "Client");
-        let members: Vec<_> = block
+        let from = PathBuf::from("elsewhere.go");
+        let resolved = index.lookup("Client", &from).unwrap();
+        assert_eq!(resolved.def.item.id.name, "Client");
+        assert_eq!(resolved.candidates, 1);
+        let members: Vec<_> = resolved
+            .def
             .members
             .iter()
             .map(|m| m.item.id.name.as_str())
             .collect();
         assert_eq!(members, vec!["Client.timeout", "Client.Close"]);
         // Qualified names fall back to their final segment.
-        assert!(index.lookup("pkg.Client").is_some());
-        assert!(index.lookup("Missing").is_none());
+        assert!(index.lookup("pkg.Client", &from).is_some());
+        assert!(index.lookup("Missing", &from).is_none());
+    }
+
+    #[test]
+    fn users_of_inverts_references() {
+        let client = item("Client", Kind::Struct, "type Client struct");
+        let mut connect = item("Connect", Kind::Function, "func Connect() *Client");
+        connect.refs = vec![crate::item::TypeRef("Client".into())];
+        let mut field = member("Pool", "Pool.client", Kind::Field, "Pool.client sdk.Client");
+        field.refs = vec![crate::item::TypeRef("sdk.Client".into())];
+        let index = TypeIndex::build(&[surface(vec![client, connect, field])]);
+
+        let users: Vec<_> = index
+            .users_of("Client")
+            .iter()
+            .map(|u| u.item.id.name.as_str())
+            .collect();
+        // Qualified references count by their final segment.
+        assert_eq!(users, vec!["Connect", "Pool.client"]);
+        assert!(index.users_of("Nobody").is_empty());
+    }
+
+    #[test]
+    fn colliding_names_prefer_the_referencing_file() {
+        let mut a = item("Config", Kind::Struct, "type Config struct");
+        a.id.path = PathBuf::from("server/config.go");
+        let mut b = item("Config", Kind::Struct, "type Config struct");
+        b.id.path = PathBuf::from("client/config.go");
+        let index = TypeIndex::build(&[surface(vec![a]), surface(vec![b])]);
+
+        let near = index
+            .lookup("Config", Path::new("client/config.go"))
+            .unwrap();
+        assert_eq!(near.def.item.id.path, PathBuf::from("client/config.go"));
+        assert_eq!(near.candidates, 2);
+
+        // From an unrelated file the pick is arbitrary but the contest
+        // is reported.
+        let far = index.lookup("Config", Path::new("other.go")).unwrap();
+        assert_eq!(far.candidates, 2);
     }
 
     #[test]
