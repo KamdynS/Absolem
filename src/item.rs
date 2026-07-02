@@ -27,10 +27,9 @@ impl fmt::Display for Line {
 }
 
 /// A reference from an item's signature to a type it uses, as written
-/// in the source (pointer/reference sugar stripped). At the syntactic
-/// tier these are *displayed* names only — resolution to an `ItemId`
-/// happens by name lookup where Surfaces aggregate, and gets exact
-/// later, when a semantic tier lands.
+/// in the source (pointer/reference sugar stripped). A display name,
+/// not a resolved identity: consumers resolve it by name lookup where
+/// Surfaces aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypeRef(pub(crate) String);
 
@@ -90,4 +89,28 @@ pub(crate) enum Kind {
     Variant,
     TraitMethod,
     AssocType,
+}
+
+impl Kind {
+    /// The kind as a `snake_case` word, for serialized output.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Struct => "struct",
+            Self::Interface => "interface",
+            Self::Type => "type",
+            Self::TypeAlias => "type_alias",
+            Self::Const => "const",
+            Self::Var => "var",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::Static => "static",
+            Self::Field => "field",
+            Self::InterfaceMethod => "interface_method",
+            Self::Variant => "variant",
+            Self::TraitMethod => "trait_method",
+            Self::AssocType => "assoc_type",
+        }
+    }
 }

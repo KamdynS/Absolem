@@ -37,6 +37,16 @@ impl ItemStatus {
     pub(crate) const fn is_changed(&self) -> bool {
         !matches!(self, Self::Unchanged)
     }
+
+    /// The status as a lowercase word, for serialized output.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Modified { .. } => "modified",
+            Self::Unchanged => "unchanged",
+        }
+    }
 }
 
 /// One rendered block: an item and its members (members never nest
@@ -92,12 +102,12 @@ pub(crate) enum FileChangeKind {
 }
 
 /// A head-wide index of item definitions by name, for resolving
-/// `TypeRef`s the syntactic way: exact name match, with a fallback to
-/// the final segment of a qualified name (`pkg.Client` → `Client`).
-/// Members attach to their parent's entry across files, so an `impl` in
-/// another file lands on the type it extends. First definition wins on
-/// cross-file name collisions — an honest Tier 0 approximation, sharpened
-/// when a semantic tier lands.
+/// `TypeRef`s: exact name match, with a fallback to the final segment
+/// of a qualified name (`pkg.Client` → `Client`). Members attach to
+/// their parent's entry across files, so an `impl` in another file
+/// lands on the type it extends. Resolution is purely name-based and
+/// first-definition-wins: when names collide across packages it can
+/// pick the wrong type.
 #[derive(Debug, Default)]
 pub(crate) struct TypeIndex {
     by_name: HashMap<String, ItemView>,

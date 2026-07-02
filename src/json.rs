@@ -1,6 +1,6 @@
-//! The JSON frontend: serializes a review for machine consumers — the
-//! seam the Neovim plugin will read the IR over (DESIGN §2). Pure —
-//! takes `&mut impl Write` like the plain-text frontend.
+//! The JSON frontend: serializes a review for machine consumers such
+//! as editor plugins. Pure — takes `&mut impl Write` like the
+//! plain-text frontend.
 //!
 //! The IR types stay serde-free; this frontend maps them to
 //! `serde_json::Value` by hand so the pure core keeps zero dependencies.
@@ -14,7 +14,6 @@ use std::io::{self, Write};
 use serde_json::{Value, json};
 
 use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView};
-use crate::item::Kind;
 
 /// Bump when the emitted shape changes incompatibly.
 const SCHEMA_VERSION: u32 = 2;
@@ -55,8 +54,8 @@ fn view_json(view: &ItemView) -> Value {
     let refs: Vec<&str> = item.refs.iter().map(|r| r.0.as_str()).collect();
     let members: Vec<Value> = view.members.iter().map(view_json).collect();
     let mut value = json!({
-        "status": status_str(&view.status),
-        "kind": kind_str(item.id.kind),
+        "status": view.status.as_str(),
+        "kind": item.id.kind.as_str(),
         "name": item.id.name,
         "signature": item.signature,
         "line": item.line.0,
@@ -74,36 +73,6 @@ fn view_json(view: &ItemView) -> Value {
     value
 }
 
-const fn status_str(status: &ItemStatus) -> &'static str {
-    match status {
-        ItemStatus::Added => "added",
-        ItemStatus::Removed => "removed",
-        ItemStatus::Modified { .. } => "modified",
-        ItemStatus::Unchanged => "unchanged",
-    }
-}
-
-const fn kind_str(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Function => "function",
-        Kind::Method => "method",
-        Kind::Struct => "struct",
-        Kind::Interface => "interface",
-        Kind::Type => "type",
-        Kind::TypeAlias => "type_alias",
-        Kind::Const => "const",
-        Kind::Var => "var",
-        Kind::Enum => "enum",
-        Kind::Trait => "trait",
-        Kind::Static => "static",
-        Kind::Field => "field",
-        Kind::InterfaceMethod => "interface_method",
-        Kind::Variant => "variant",
-        Kind::TraitMethod => "trait_method",
-        Kind::AssocType => "assoc_type",
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -111,7 +80,7 @@ mod tests {
 
     use super::*;
     use crate::core::ChangeSet;
-    use crate::item::{Item, ItemId, Line, TypeRef};
+    use crate::item::{Item, ItemId, Kind, Line, TypeRef};
 
     fn item(name: &str, kind: Kind, sig: &str, line: u32) -> Item {
         Item {
