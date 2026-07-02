@@ -121,6 +121,10 @@ pub(crate) struct Resolved<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct TypeIndex {
     by_name: HashMap<String, Vec<ItemView>>,
+    /// The inverse edge: type name → every item whose signature
+    /// references it. Keyed by the final segment of the reference as
+    /// written, matching how `lookup` normalizes.
+    users: HashMap<String, Vec<ItemView>>,
 }
 
 impl TypeIndex {
@@ -154,7 +158,26 @@ impl TypeIndex {
                     .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
             }
         }
-        Self { by_name }
+        let mut users: HashMap<String, Vec<ItemView>> = HashMap::new();
+        for surface in surfaces {
+            for item in surface.iter() {
+                for reference in &item.refs {
+                    let name = final_segment(&reference.0);
+                    users
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(ItemView::leaf(ItemStatus::Unchanged, item.clone()));
+                }
+            }
+        }
+        Self { by_name, users }
+    }
+
+    /// Every item whose signature references `name` — the reverse of
+    /// `lookup`. Name-based, like everything at this tier: two types
+    /// sharing a name share a user list.
+    pub(crate) fn users_of(&self, name: &str) -> &[ItemView] {
+        self.users.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Resolves `name` as seen from `from` (the referencing item's
@@ -173,10 +196,15 @@ impl TypeIndex {
 
     fn candidates(&self, name: &str) -> Option<&Vec<ItemView>> {
         self.by_name.get(name).or_else(|| {
-            let last = name.rsplit(['.', ':']).next()?;
+            let last = final_segment(name);
             (last != name).then(|| self.by_name.get(last))?
         })
     }
+}
+
+/// `pkg.Client` → `Client`, `Foo::Bar` → `Bar`; a bare name unchanged.
+fn final_segment(name: &str) -> &str {
+    name.rsplit(['.', ':']).next().unwrap_or(name)
 }
 
 pub(crate) fn diff(base: &Surface, head: &Surface) -> ChangeSet {
@@ -485,6 +513,25 @@ mod tests {
         // Qualified names fall back to their final segment.
         assert!(index.lookup("pkg.Client", &from).is_some());
         assert!(index.lookup("Missing", &from).is_none());
+    }
+
+    #[test]
+    fn users_of_inverts_references() {
+        let client = item("Client", Kind::Struct, "type Client struct");
+        let mut connect = item("Connect", Kind::Function, "func Connect() *Client");
+        connect.refs = vec![crate::item::TypeRef("Client".into())];
+        let mut field = member("Pool", "Pool.client", Kind::Field, "Pool.client sdk.Client");
+        field.refs = vec![crate::item::TypeRef("sdk.Client".into())];
+        let index = TypeIndex::build(&[surface(vec![client, connect, field])]);
+
+        let users: Vec<_> = index
+            .users_of("Client")
+            .iter()
+            .map(|u| u.item.id.name.as_str())
+            .collect();
+        // Qualified references count by their final segment.
+        assert_eq!(users, vec!["Connect", "Pool.client"]);
+        assert!(index.users_of("Nobody").is_empty());
     }
 
     #[test]
