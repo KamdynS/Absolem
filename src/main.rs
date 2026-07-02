@@ -11,7 +11,7 @@ mod surface;
 mod tui;
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -29,15 +29,18 @@ use crate::tui::EditorLauncher;
 /// didn't choose. Constructed only here, at the composition root.
 struct RealEditor {
     program: Option<String>,
+    /// Review paths are repo-root-relative; they are joined here so the
+    /// editor opens the right file however deep the invocation was.
+    repo_root: PathBuf,
 }
 
 impl RealEditor {
-    fn from_env() -> Self {
+    fn from_env(repo_root: PathBuf) -> Self {
         let program = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
             .ok()
             .filter(|p| !p.trim().is_empty());
-        Self { program }
+        Self { program, repo_root }
     }
 }
 
@@ -50,7 +53,7 @@ impl EditorLauncher for RealEditor {
         };
         let status = std::process::Command::new(program)
             .arg(format!("+{line}"))
-            .arg(path)
+            .arg(self.repo_root.join(path))
             .status()?;
         if status.success() {
             Ok(())
@@ -118,8 +121,14 @@ impl Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let repo_dir = std::env::current_dir().context("failed to read current working directory")?;
-    let git = RealGit::new(repo_dir);
+    // All paths in a review are repo-root-relative, so the process is
+    // re-homed to the top level: running from a subdirectory then
+    // behaves identically to running from the root.
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    let repo_root = RealGit::new(cwd)
+        .toplevel()
+        .context("not inside a git repository")?;
+    let git = RealGit::new(repo_root.clone());
 
     let range = resolve_range(&git, cli.range.as_deref())?;
     let changed = git
@@ -161,7 +170,8 @@ fn main() -> Result<()> {
         }
         OutputMode::Interactive => {
             let index = build_type_index(&git, &mut registry, &range.head);
-            tui::run(&review, index, &RealEditor::from_env()).context("interactive view failed")?;
+            tui::run(&review, index, &RealEditor::from_env(repo_root))
+                .context("interactive view failed")?;
         }
     }
 

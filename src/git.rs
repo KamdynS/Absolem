@@ -87,6 +87,15 @@ impl RealGit {
         }
     }
 
+    /// The repository's top-level directory. Everything downstream —
+    /// diff paths, file reads, editor jumps — is repo-root-relative, so
+    /// the composition root re-homes here before any other git call.
+    pub(crate) fn toplevel(&self) -> Result<PathBuf, GitError> {
+        Ok(PathBuf::from(
+            self.run_checked(&["rev-parse", "--show-toplevel"])?.trim(),
+        ))
+    }
+
     fn run(&self, args: &[&str]) -> Result<std::process::Output, GitError> {
         Ok(Command::new("git")
             .args(args)
