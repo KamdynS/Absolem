@@ -13,6 +13,34 @@ pub(crate) enum GitError {
     UnexpectedOutput(String),
 }
 
+/// How the two refs of a review are compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffMode {
+    /// Three-dot: changes since the merge base — what GitHub/GitLab show
+    /// on a PR, and the default.
+    MergeBase,
+    /// Two-dot: a direct tree-to-tree diff between the refs.
+    Direct,
+}
+
+/// The pair of refs under review, plus the semantics for comparing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefRange {
+    pub(crate) base: String,
+    pub(crate) head: String,
+    pub(crate) mode: DiffMode,
+}
+
+impl RefRange {
+    fn to_git_range(&self) -> String {
+        let dots = match self.mode {
+            DiffMode::MergeBase => "...",
+            DiffMode::Direct => "..",
+        };
+        format!("{}{}{}", self.base, dots, self.head)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChangedFile {
     pub(crate) path: PathBuf,
@@ -31,12 +59,21 @@ pub(crate) trait GitRepo {
     /// `origin/main` and `origin/master`.
     fn ref_exists(&self, ref_name: &str) -> Result<bool, GitError>;
 
-    /// Files changed in the three-dot range `base...head` (i.e. against
-    /// the merge-base, matching what GitHub/GitLab show on a PR).
-    fn changed_files(&self, base: &str, head: &str) -> Result<Vec<ChangedFile>, GitError>;
+    /// Files changed across `range`, honoring its two-dot/three-dot
+    /// semantics.
+    fn changed_files(&self, range: &RefRange) -> Result<Vec<ChangedFile>, GitError>;
+
+    /// The merge base of two refs. Three-dot reviews read base content
+    /// here, so work that landed on base after the branch point is not
+    /// misattributed to the branch.
+    fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError>;
 
     /// Read the contents of `path` at revision `rev`.
     fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError>;
+
+    /// Every file in the tree at `rev`, repo-relative. Feeds the
+    /// head-wide type index that resolves `TypeRef`s by name.
+    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError>;
 }
 
 pub(crate) struct RealGit {
@@ -77,15 +114,27 @@ impl GitRepo for RealGit {
             .success())
     }
 
-    fn changed_files(&self, base: &str, head: &str) -> Result<Vec<ChangedFile>, GitError> {
-        let range = format!("{base}...{head}");
-        let raw = self.run_checked(&["diff", "--name-status", "-z", &range])?;
+    fn changed_files(&self, range: &RefRange) -> Result<Vec<ChangedFile>, GitError> {
+        let raw = self.run_checked(&["diff", "--name-status", "-z", &range.to_git_range()])?;
         parse_name_status(&raw)
+    }
+
+    fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
+        Ok(self.run_checked(&["merge-base", a, b])?.trim().to_owned())
     }
 
     fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError> {
         let spec = format!("{}:{}", rev, path.display());
         self.run_checked(&["show", &spec])
+    }
+
+    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError> {
+        let raw = self.run_checked(&["ls-tree", "-r", "--name-only", "-z", rev])?;
+        Ok(raw
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect())
     }
 }
 
@@ -177,5 +226,21 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_list() {
         assert!(parse_name_status("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ref_range_formats_dot_count_from_semantics() {
+        let three = RefRange {
+            base: "main".into(),
+            head: "HEAD".into(),
+            mode: DiffMode::MergeBase,
+        };
+        assert_eq!(three.to_git_range(), "main...HEAD");
+        let two = RefRange {
+            base: "v1".into(),
+            head: "v2".into(),
+            mode: DiffMode::Direct,
+        };
+        assert_eq!(two.to_git_range(), "v1..v2");
     }
 }

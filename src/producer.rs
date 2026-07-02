@@ -20,7 +20,7 @@ pub(crate) enum ProducerError {
 
 /// A syntactic producer for one language: parses source at a path into the
 /// structural `Surface`. Object-safe so a heterogeneous `Registry` can hold
-/// producers for different languages behind one extraction path (STYLE §6).
+/// producers for different languages behind one extraction path.
 pub(crate) trait Producer {
     fn extract(&mut self, path: &Path, source: &str) -> Result<Surface, ProducerError>;
 }

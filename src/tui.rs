@@ -12,18 +12,40 @@
 //!
 //! Same convention as the plain-text frontend (`+`/`-`/`~`), here carried by
 //! color: added green, removed red, modified yellow with the old signature
-//! dimmed beneath. The cursor's row is shown reversed. No resolution, no
-//! navigation across refs — just shape.
+//! dimmed beneath. The cursor's row is shown reversed. All colors are
+//! ANSI palette entries, never RGB, so the view absorbs the terminal
+//! emulator's theme instead of fighting it. No resolution and no
+//! navigation across refs — just shape, plus a jump out to `$EDITOR`.
 
+use std::collections::HashSet;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::style::{Modifier, Stylize};
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::core::{Change, FileChange, FileChangeKind};
+use crate::core::{FileChange, FileChangeKind, ItemStatus, ItemView, TypeIndex};
+use crate::item::Line as SourceLine;
+
+/// The authority to open the user's editor at a location. The TUI can
+/// spawn a process no other way: only the composition root constructs
+/// the real, `$EDITOR`-backed implementation, and tests substitute an
+/// in-memory fake.
+pub(crate) trait EditorLauncher {
+    fn open(&self, path: &Path, line: SourceLine) -> io::Result<()>;
+}
+
+/// Where a cursor stop leads when opened: the file and line of the item
+/// at the ref under review. Removed items have nowhere to go — they no
+/// longer exist on the head side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JumpTarget {
+    path: PathBuf,
+    line: SourceLine,
+}
 
 /// A review turned into display lines plus the indices of the lines the
 /// cursor may land on. Blank separators and `was:` continuation rows are
@@ -31,6 +53,13 @@ use crate::core::{Change, FileChange, FileChangeKind};
 struct Rendered {
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
+    /// Parallel to `stops`: where each stop jumps when opened.
+    jumps: Vec<Option<JumpTarget>>,
+    /// Parallel to `stops`: whether the row references a type the index
+    /// can resolve, i.e. whether `Tab` will do anything.
+    expandable: Vec<bool>,
+    /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
+    headers: Vec<usize>,
 }
 
 /// A decoded normal-mode command. `usize` payloads are repeat counts; the
@@ -58,6 +87,13 @@ enum Motion {
     ViewBottom,
     NextMatch,
     PrevMatch,
+    /// `{` / `}` — move the cursor to the previous / next file header.
+    PrevFile(usize),
+    NextFile(usize),
+    /// `Tab` — expand or collapse the types the cursor's item references.
+    Expand,
+    /// `Enter` — open the cursor's item in the user's editor.
+    Open,
     Quit,
 }
 
@@ -155,6 +191,10 @@ impl InputState {
             (false, KeyCode::Char('L')) => Motion::CursorLow,
             (false, KeyCode::Char('n')) => Motion::NextMatch,
             (false, KeyCode::Char('N')) => Motion::PrevMatch,
+            (false, KeyCode::Char('{')) => Motion::PrevFile(times),
+            (false, KeyCode::Char('}')) => Motion::NextFile(times),
+            (false, KeyCode::Tab) => Motion::Expand,
+            (false, KeyCode::Enter) => Motion::Open,
             _ => return None,
         };
         Some(motion)
@@ -166,26 +206,87 @@ impl InputState {
 /// screen. `viewport_height` is the last drawn body height, recorded each
 /// frame so the motion handlers can clamp without the terminal.
 struct App {
+    /// The review being displayed — kept so the pane can re-render when
+    /// an expansion toggles.
+    review: Vec<FileChange>,
+    /// The head-wide index expansions resolve against.
+    index: TypeIndex,
+    /// Stop indices whose expansion is currently open.
+    expanded: HashSet<usize>,
     lines: Vec<Line<'static>>,
     stops: Vec<u16>,
+    /// Parallel to `stops`: where each stop jumps when opened.
+    jumps: Vec<Option<JumpTarget>>,
+    /// Parallel to `stops`: whether the row has at least one reference
+    /// that resolves in the index.
+    expandable: Vec<bool>,
+    /// Indices into `stops` that are file rows — the `{` / `}` waypoints.
+    headers: Vec<usize>,
     /// Stop indices whose row matched the last committed search.
     matches: Vec<usize>,
+    /// The title-bar summary: file and change counts.
+    summary: String,
     cursor: usize,
     scroll: u16,
     viewport_height: u16,
 }
 
 impl App {
-    fn new(review: &[FileChange]) -> Self {
-        let Rendered { lines, stops } = render_lines(review);
-        Self {
-            lines,
-            stops,
+    fn new(review: &[FileChange], index: TypeIndex) -> Self {
+        let mut app = Self {
+            review: review.to_vec(),
+            index,
+            expanded: HashSet::new(),
+            lines: Vec::new(),
+            stops: Vec::new(),
+            jumps: Vec::new(),
+            expandable: Vec::new(),
+            headers: Vec::new(),
             matches: Vec::new(),
+            summary: summarize(review),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
+        };
+        app.rerender();
+        app
+    }
+
+    /// Rebuilds the display lines from the review and the current
+    /// expansion state. Stops are stable across toggles (expansion rows
+    /// are not stops), so the cursor keeps its position.
+    fn rerender(&mut self) {
+        let Rendered {
+            lines,
+            stops,
+            jumps,
+            expandable,
+            headers,
+        } = render_lines(&self.review, &self.expanded, &self.index);
+        self.lines = lines;
+        self.stops = stops;
+        self.jumps = jumps;
+        self.expandable = expandable;
+        self.headers = headers;
+        self.scroll_to_cursor();
+    }
+
+    /// `Tab`: toggles the cursor row's expansion. Returns a footer
+    /// notice when there is nothing to expand.
+    fn toggle_expand(&mut self) -> Option<String> {
+        if !self.expandable.get(self.cursor).copied().unwrap_or(false) {
+            return Some(" nothing to expand here ".to_owned());
         }
+        if !self.expanded.remove(&self.cursor) {
+            self.expanded.insert(self.cursor);
+        }
+        self.rerender();
+        None
+    }
+
+    /// Where the cursor's stop leads, if anywhere.
+    fn current_jump(&self) -> Option<&JumpTarget> {
+        self.jumps.get(self.cursor).and_then(Option::as_ref)
     }
 
     /// Largest valid top-line index: enough to bring the final line into
@@ -226,7 +327,11 @@ impl App {
             Motion::ViewBottom => self.scroll_cursor_to(ViewSpot::Bottom),
             Motion::NextMatch => self.next_match(),
             Motion::PrevMatch => self.prev_match(),
-            Motion::Quit => {}
+            Motion::PrevFile(n) => self.prev_file(n),
+            Motion::NextFile(n) => self.next_file(n),
+            // Expand, Open, and Quit are handled by the event loop: they
+            // either re-render or act on the world outside the pane.
+            Motion::Expand | Motion::Open | Motion::Quit => {}
         }
     }
 
@@ -340,6 +445,37 @@ impl App {
         self.scroll = line.saturating_sub(offset).min(self.max_scroll());
     }
 
+    /// `{`: the `n`-th file header strictly before the cursor, saturating
+    /// at the first.
+    fn prev_file(&mut self, n: usize) {
+        let before = self.headers.iter().filter(|&&h| h < self.cursor).count();
+        let Some(&target) = before
+            .checked_sub(n)
+            .or(if before > 0 { Some(0) } else { None })
+            .and_then(|i| self.headers.get(i))
+        else {
+            return;
+        };
+        self.cursor = target;
+        self.scroll_to_cursor();
+    }
+
+    /// `}`: the `n`-th file header strictly after the cursor, saturating
+    /// at the last.
+    fn next_file(&mut self, n: usize) {
+        let mut after = self.headers.iter().filter(|&&h| h > self.cursor);
+        let Some(&target) = after
+            .nth(n.saturating_sub(1))
+            .or_else(|| self.headers.last())
+        else {
+            return;
+        };
+        if target > self.cursor {
+            self.cursor = target;
+            self.scroll_to_cursor();
+        }
+    }
+
     fn next_match(&mut self) {
         if self.matches.is_empty() {
             return;
@@ -375,79 +511,338 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-/// Turns a review into the styled lines the pane scrolls over and the set of
-/// cursor stops. Files are separated by a blank line, mirroring the
-/// plain-text frontend. Stops are the file headers and the change rows; the
-/// blank separators and the `was:` continuation lines are skipped.
-fn render_lines(review: &[FileChange]) -> Rendered {
-    let mut lines = Vec::new();
-    let mut stops = Vec::new();
-    if review.is_empty() {
-        lines.push(Line::from("No structural changes.").dim());
-        return Rendered { lines, stops };
+/// The two sides of a modified signature as spans, with the tokens that
+/// differ marked: struck out on the old side, bold and underlined on
+/// the new. A hand-rolled token LCS — signatures are one line, so the
+/// quadratic table is nothing.
+fn modified_spans(before: &str, after: &str) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let before_tokens = tokenize(before);
+    let after_tokens = tokenize(after);
+    let (before_common, after_common) = lcs_membership(&before_tokens, &after_tokens);
+    (
+        marked_spans(&before_tokens, &before_common, Modifier::CROSSED_OUT),
+        marked_spans(
+            &after_tokens,
+            &after_common,
+            Modifier::BOLD | Modifier::UNDERLINED,
+        ),
+    )
+}
+
+/// Splits into word runs (`[A-Za-z0-9_]+`) and single non-word
+/// characters, so a renamed parameter or a changed type marks as one
+/// token, not per character.
+fn tokenize(s: &str) -> Vec<&str> {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_word(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            out.push(&s[start..i]);
+        } else {
+            let len = s[i..].chars().next().map_or(1, char::len_utf8);
+            out.push(&s[i..i + len]);
+            i += len;
+        }
     }
-    let stop = |lines: &[Line<'static>], stops: &mut Vec<u16>| {
-        stops.push(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-    };
+    out
+}
+
+/// For each side, whether the token is part of the longest common
+/// subsequence — `false` means the token changed.
+fn lcs_membership(left: &[&str], right: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let (rows, cols) = (left.len(), right.len());
+    // table[row][col] = LCS length of left[row..] and right[col..].
+    let mut table = vec![vec![0u16; cols + 1]; rows + 1];
+    for row in (0..rows).rev() {
+        for col in (0..cols).rev() {
+            table[row][col] = if left[row] == right[col] {
+                table[row + 1][col + 1] + 1
+            } else {
+                table[row + 1][col].max(table[row][col + 1])
+            };
+        }
+    }
+    let (mut in_left, mut in_right) = (vec![false; rows], vec![false; cols]);
+    let (mut row, mut col) = (0, 0);
+    while row < rows && col < cols {
+        if left[row] == right[col] {
+            in_left[row] = true;
+            in_right[col] = true;
+            row += 1;
+            col += 1;
+        } else if table[row + 1][col] >= table[row][col + 1] {
+            row += 1;
+        } else {
+            col += 1;
+        }
+    }
+    (in_left, in_right)
+}
+
+/// Tokens back into spans, adjacent same-state tokens merged; tokens
+/// outside the common subsequence carry `marker`.
+fn marked_spans(tokens: &[&str], common: &[bool], marker: Modifier) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_common = true;
+    for (token, &is_common) in tokens.iter().zip(common) {
+        if is_common != run_common && !run.is_empty() {
+            out.push(span_for(std::mem::take(&mut run), run_common, marker));
+        }
+        run_common = is_common;
+        run.push_str(token);
+    }
+    if !run.is_empty() {
+        out.push(span_for(run, run_common, marker));
+    }
+    out
+}
+
+fn span_for(text: String, common: bool, marker: Modifier) -> Span<'static> {
+    if common {
+        Span::raw(text)
+    } else {
+        Span::styled(text, Style::default().add_modifier(marker))
+    }
+}
+
+/// Accumulates the rendered lines and, in parallel, the cursor stops
+/// with their jump targets. Blank separators and `was:` continuation
+/// rows are lines but not stops.
+#[derive(Default)]
+struct LineBuilder {
+    lines: Vec<Line<'static>>,
+    stops: Vec<u16>,
+    jumps: Vec<Option<JumpTarget>>,
+    expandable: Vec<bool>,
+    headers: Vec<usize>,
+}
+
+impl LineBuilder {
+    /// Pushes a line the cursor can land on.
+    fn stop(&mut self, line: Line<'static>, jump: Option<JumpTarget>, expandable: bool) {
+        self.stops
+            .push(u16::try_from(self.lines.len()).unwrap_or(u16::MAX));
+        self.jumps.push(jump);
+        self.expandable.push(expandable);
+        self.lines.push(line);
+    }
+
+    /// One item row at `indent`: status marker and color by status,
+    /// unchanged context dimmed, a modified row's old signature beneath,
+    /// and — when the row's stop is in `expanded` — the definitions of
+    /// the types it references, indented below.
+    fn item_row(
+        &mut self,
+        view: &ItemView,
+        indent: usize,
+        path: &std::path::Path,
+        expanded: &HashSet<usize>,
+        index: &TypeIndex,
+    ) {
+        let pad = " ".repeat(indent);
+        let sig = &view.item.signature;
+        let jump_to = |line: SourceLine| {
+            Some(JumpTarget {
+                path: path.to_path_buf(),
+                line,
+            })
+        };
+        let expandable = view.item.refs.iter().any(|r| index.lookup(&r.0).is_some());
+        match &view.status {
+            ItemStatus::Added => {
+                self.stop(
+                    Line::from(format!("{pad}+ {sig}")).green(),
+                    jump_to(view.item.line),
+                    expandable,
+                );
+            }
+            ItemStatus::Removed => {
+                self.stop(Line::from(format!("{pad}- {sig}")).red(), None, expandable);
+            }
+            ItemStatus::Modified { before } => {
+                // Word-level diff: what changed within the signature is
+                // marked, so the eye needn't compare the two lines.
+                let (before_spans, after_spans) = modified_spans(&before.signature, sig);
+                let mut row = vec![Span::raw(format!("{pad}~ "))];
+                row.extend(after_spans);
+                self.stop(
+                    Line::from(row).yellow(),
+                    jump_to(view.item.line),
+                    expandable,
+                );
+                let mut was = vec![Span::raw(format!("{pad}    was: "))];
+                was.extend(before_spans);
+                self.lines.push(Line::from(was).dim());
+            }
+            ItemStatus::Unchanged => {
+                self.stop(
+                    Line::from(format!("{pad}  {sig}")).dim(),
+                    jump_to(view.item.line),
+                    expandable,
+                );
+            }
+        }
+        if expanded.contains(&(self.stops.len() - 1)) {
+            self.expansion(view, indent, index);
+        }
+    }
+
+    /// The definitions of the types `view` references, as non-stop
+    /// context lines: each resolved ref renders its signature, where it
+    /// lives, and its members.
+    fn expansion(&mut self, view: &ItemView, indent: usize, index: &TypeIndex) {
+        let pad = " ".repeat(indent + 4);
+        for r in &view.item.refs {
+            let Some(def) = index.lookup(&r.0) else {
+                continue;
+            };
+            let at = format!("  · {}:{}", def.item.id.path.display(), def.item.line);
+            self.lines.push(
+                Line::from(vec![
+                    Span::raw(format!("{pad}▸ {}", def.item.signature)),
+                    Span::raw(at).dim(),
+                ])
+                .cyan(),
+            );
+            for member in &def.members {
+                self.lines.push(
+                    Line::from(format!("{pad}      {}", member.item.signature))
+                        .cyan()
+                        .dim(),
+                );
+            }
+        }
+    }
+}
+
+/// Turns a review into the styled lines the pane scrolls over, the set of
+/// cursor stops, and each stop's jump target. Layout mirrors the plain
+/// frontend: members indented under their block header, composites set
+/// off as paragraphs, files separated by a blank line. Every item row is
+/// a stop (unchanged context included — it can still be expanded or
+/// jumped to); removed rows and deleted files have nowhere to go.
+fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIndex) -> Rendered {
+    let mut b = LineBuilder::default();
+    if review.is_empty() {
+        b.lines.push(Line::from("No structural changes.").dim());
+        return Rendered {
+            lines: b.lines,
+            stops: b.stops,
+            jumps: b.jumps,
+            expandable: b.expandable,
+            headers: b.headers,
+        };
+    }
     for (i, file) in review.iter().enumerate() {
         if i > 0 {
-            lines.push(Line::default());
+            b.lines.push(Line::default());
         }
+        b.headers.push(b.stops.len());
         match &file.kind {
             FileChangeKind::Deleted => {
-                stop(&lines, &mut stops);
-                lines.push(
+                b.stop(
                     Line::from(format!("DELETED {}", file.path.display()))
                         .red()
                         .bold(),
+                    None,
+                    false,
                 );
             }
             FileChangeKind::Changed(changeset) => {
-                stop(&lines, &mut stops);
-                lines.push(Line::from(file.path.display().to_string()).bold());
-                for change in &changeset.changes {
-                    stop(&lines, &mut stops);
-                    match change {
-                        Change::Added(item) => {
-                            lines.push(Line::from(format!("  + {}", item.signature)).green());
-                        }
-                        Change::Removed(item) => {
-                            lines.push(Line::from(format!("  - {}", item.signature)).red());
-                        }
-                        Change::Modified { before, after } => {
-                            lines.push(Line::from(format!("  ~ {}", after.signature)).yellow());
-                            lines
-                                .push(Line::from(format!("      was: {}", before.signature)).dim());
-                        }
+                b.stop(
+                    Line::from(file.path.display().to_string()).bold(),
+                    Some(JumpTarget {
+                        path: file.path.clone(),
+                        line: SourceLine(1),
+                    }),
+                    false,
+                );
+                let mut prev_was_composite = false;
+                for block in &changeset.blocks {
+                    let composite = !block.members.is_empty();
+                    if composite || prev_was_composite {
+                        b.lines.push(Line::default());
                     }
+                    b.item_row(block, 2, &file.path, expanded, index);
+                    for member in &block.members {
+                        b.item_row(member, 6, &file.path, expanded, index);
+                    }
+                    prev_was_composite = composite;
                 }
             }
         }
     }
-    Rendered { lines, stops }
+    Rendered {
+        lines: b.lines,
+        stops: b.stops,
+        jumps: b.jumps,
+        expandable: b.expandable,
+        headers: b.headers,
+    }
+}
+
+/// The title-bar summary: `5 files · +12 ~3 -4`, with deleted files
+/// counted among the files but not the change tallies.
+fn summarize(review: &[FileChange]) -> String {
+    let (mut added, mut modified, mut removed) = (0usize, 0usize, 0usize);
+    let mut tally = |view: &ItemView| match view.status {
+        ItemStatus::Added => added += 1,
+        ItemStatus::Modified { .. } => modified += 1,
+        ItemStatus::Removed => removed += 1,
+        ItemStatus::Unchanged => {}
+    };
+    for file in review {
+        if let FileChangeKind::Changed(changeset) = &file.kind {
+            for block in &changeset.blocks {
+                tally(block);
+                for member in &block.members {
+                    tally(member);
+                }
+            }
+        }
+    }
+    let files = review.len();
+    let plural = if files == 1 { "file" } else { "files" };
+    format!("{files} {plural} · +{added} ~{modified} -{removed}")
 }
 
 /// Runs the interactive view until the user quits. The effectful edge:
 /// sets up the terminal (raw mode + alternate screen via `ratatui::init`),
 /// pumps key events, and restores the terminal on the way out.
-pub(crate) fn run(review: &[FileChange]) -> io::Result<()> {
+pub(crate) fn run(
+    review: &[FileChange],
+    index: TypeIndex,
+    editor: &impl EditorLauncher,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut App::new(review));
+    let result = event_loop(&mut terminal, &mut App::new(review, index), editor);
     ratatui::restore();
     result
 }
 
-const HELP: &str = " j/k move · ^d/^u/^f/^b scroll · gg/G ends · H/M/L view · zt/zz/zb center · / search · n/N matches · q quit ";
+const HELP: &str = " j/k move · {/} files · / search · n/N matches · ⇥ expand · ↵ edit · q quit ";
 
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    editor: &impl EditorLauncher,
+) -> io::Result<()> {
     let mut input = InputState::default();
     let mut mode = Mode::Normal;
     let mut query = String::new();
+    let mut notice: Option<String> = None;
     loop {
         let footer = if mode == Mode::Search {
             format!(" /{query} ")
         } else {
-            HELP.to_owned()
+            notice.take().unwrap_or_else(|| HELP.to_owned())
         };
         terminal.draw(|frame| draw(frame, app, &footer))?;
         let Event::Key(key) = event::read()? else {
@@ -478,21 +873,52 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                     mode = Mode::Search;
                     query.clear();
                 } else if let Some(motion) = input.feed(key.code, ctrl) {
-                    if motion == Motion::Quit {
-                        return Ok(());
+                    match motion {
+                        Motion::Quit => return Ok(()),
+                        Motion::Open => notice = open_in_editor(terminal, app, editor)?,
+                        Motion::Expand => notice = app.toggle_expand(),
+                        _ => app.apply(motion),
                     }
-                    app.apply(motion);
                 }
             }
         }
     }
 }
 
+/// Opens the cursor's item in the user's editor, suspending the TUI
+/// around the child process: the terminal is restored before the editor
+/// takes the tty and re-initialized after it exits. Returns a footer
+/// notice when there is nothing to open or the editor failed; editor
+/// failure is a notice rather than an error because the review is still
+/// usable.
+fn open_in_editor(
+    terminal: &mut DefaultTerminal,
+    app: &App,
+    editor: &impl EditorLauncher,
+) -> io::Result<Option<String>> {
+    let Some(target) = app.current_jump() else {
+        return Ok(Some(
+            " nothing to open here (removed items have no location) ".to_owned(),
+        ));
+    };
+    ratatui::restore();
+    let opened = editor.open(&target.path, target.line);
+    *terminal = ratatui::init();
+    terminal.clear()?;
+    Ok(opened.err().map(|e| format!(" editor failed: {e} ")))
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, footer: &str) {
+    let position = if app.stops.is_empty() {
+        String::new()
+    } else {
+        format!(" {}/{} ", app.cursor + 1, app.stops.len())
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" absolem — shape of the change ")
-        .title_bottom(footer);
+        .title(format!(" absolem · {} ", app.summary))
+        .title_bottom(footer)
+        .title_bottom(Line::from(position).right_aligned());
     // Record the inner height so scroll clamping matches what's on screen,
     // and re-follow the cursor in case a resize moved it out of view.
     app.viewport_height = block.inner(frame.area()).height;
@@ -535,13 +961,37 @@ mod tests {
                 name: name.into(),
             },
             signature: sig.into(),
+            // Qualified: `Line` unqualified is ratatui's in this module.
+            line: crate::item::Line(1),
+            parent: None,
+            refs: Vec::new(),
         }
     }
 
-    fn changed(path: &str, changes: Vec<Change>) -> FileChange {
+    fn leaf(status: ItemStatus, item: Item) -> ItemView {
+        ItemView {
+            status,
+            item,
+            members: Vec::new(),
+        }
+    }
+
+    fn added(item: Item) -> ItemView {
+        leaf(ItemStatus::Added, item)
+    }
+
+    fn removed(item: Item) -> ItemView {
+        leaf(ItemStatus::Removed, item)
+    }
+
+    fn modified(before: Item, after: Item) -> ItemView {
+        leaf(ItemStatus::Modified { before }, after)
+    }
+
+    fn changed(path: &str, blocks: Vec<ItemView>) -> FileChange {
         FileChange {
             path: PathBuf::from(path),
-            kind: FileChangeKind::Changed(ChangeSet { changes }),
+            kind: FileChangeKind::Changed(ChangeSet { blocks }),
         }
     }
 
@@ -549,15 +999,25 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// `App` with an empty type index — expansion is exercised separately.
+    fn app(review: &[FileChange]) -> App {
+        App::new(review, TypeIndex::default())
+    }
+
+    /// `render_lines` with no expansions and an empty index.
+    fn render(review: &[FileChange]) -> Rendered {
+        render_lines(review, &HashSet::new(), &TypeIndex::default())
+    }
+
     /// Three added items in one file: 1 header + 3 change rows = 4 stops over
     /// 4 lines. Used by the cursor/scroll tests.
     fn three_items() -> App {
-        App::new(&[changed(
+        app(&[changed(
             "a.go",
             vec![
-                Change::Added(item("A", "func A()")),
-                Change::Added(item("B", "func B()")),
-                Change::Added(item("C", "func C()")),
+                added(item("A", "func A()")),
+                added(item("B", "func B()")),
+                added(item("C", "func C()")),
             ],
         )])
     }
@@ -566,14 +1026,14 @@ mod tests {
     /// over n+1 lines. Used by the viewport-positioning tests.
     fn many_items(n: usize) -> App {
         let changes = (0..n)
-            .map(|i| Change::Added(item(&format!("F{i}"), &format!("func F{i}()"))))
+            .map(|i| added(item(&format!("F{i}"), &format!("func F{i}()"))))
             .collect();
-        App::new(&[changed("a.go", changes)])
+        app(&[changed("a.go", changes)])
     }
 
     #[test]
     fn empty_review_shows_placeholder() {
-        let rendered = render_lines(&[]);
+        let rendered = render(&[]);
         assert_eq!(rendered.lines.len(), 1);
         assert_eq!(text(&rendered.lines[0]), "No structural changes.");
         assert!(rendered.stops.is_empty());
@@ -581,14 +1041,11 @@ mod tests {
 
     #[test]
     fn changed_file_renders_header_then_prefixed_changes() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
             vec![
-                Change::Added(item("A", "func A()")),
-                Change::Modified {
-                    before: item("B", "func B()"),
-                    after: item("B", "func B(x int)"),
-                },
+                added(item("A", "func A()")),
+                modified(item("B", "func B()"), item("B", "func B(x int)")),
             ],
         )]);
         let lines: Vec<String> = rendered.lines.iter().map(text).collect();
@@ -605,12 +1062,9 @@ mod tests {
 
     #[test]
     fn stops_are_headers_and_change_rows_only() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
-            vec![Change::Modified {
-                before: item("B", "func B()"),
-                after: item("B", "func B(x int)"),
-            }],
+            vec![modified(item("B", "func B()"), item("B", "func B(x int)"))],
         )]);
         // Lines: 0 header, 1 "~", 2 "was:". The continuation row is not a stop.
         assert_eq!(rendered.stops, vec![0, 1]);
@@ -618,12 +1072,9 @@ mod tests {
 
     #[test]
     fn change_lines_are_colored_by_kind() {
-        let rendered = render_lines(&[changed(
+        let rendered = render(&[changed(
             "a.go",
-            vec![
-                Change::Added(item("A", "func A()")),
-                Change::Removed(item("C", "func C()")),
-            ],
+            vec![added(item("A", "func A()")), removed(item("C", "func C()"))],
         )]);
         assert_eq!(rendered.lines[1].style.fg, Some(Color::Green));
         assert_eq!(rendered.lines[2].style.fg, Some(Color::Red));
@@ -631,8 +1082,8 @@ mod tests {
 
     #[test]
     fn files_separated_by_blank_line() {
-        let rendered = render_lines(&[
-            changed("a.go", vec![Change::Added(item("A", "func A()"))]),
+        let rendered = render(&[
+            changed("a.go", vec![added(item("A", "func A()"))]),
             FileChange {
                 path: PathBuf::from("b.go"),
                 kind: FileChangeKind::Deleted,
@@ -715,7 +1166,7 @@ mod tests {
 
     #[test]
     fn motions_are_noops_on_empty_review() {
-        let mut app = App::new(&[]);
+        let mut app = app(&[]);
         app.viewport_height = 10;
         app.cursor_down(1);
         app.goto_item(Some(2), true);
@@ -847,6 +1298,218 @@ mod tests {
     }
 
     #[test]
+    fn input_decodes_file_hops_with_counts() {
+        let mut input = InputState::default();
+        assert_eq!(
+            input.feed(KeyCode::Char('{'), false),
+            Some(Motion::PrevFile(1))
+        );
+        assert_eq!(input.feed(KeyCode::Char('2'), false), None);
+        assert_eq!(
+            input.feed(KeyCode::Char('}'), false),
+            Some(Motion::NextFile(2))
+        );
+    }
+
+    #[test]
+    fn file_hops_move_between_headers_and_saturate() {
+        let mut app = three_files(); // headers at stops 0, 2, 4
+        app.viewport_height = 20;
+        assert_eq!(app.headers, vec![0, 2, 4]);
+        app.next_file(1);
+        assert_eq!(app.cursor, 2);
+        app.next_file(5); // saturates at the last header
+        assert_eq!(app.cursor, 4);
+        app.cursor_down(1); // onto c.go's change row
+        app.prev_file(1);
+        assert_eq!(app.cursor, 4);
+        app.prev_file(2);
+        assert_eq!(app.cursor, 0);
+        app.prev_file(1); // already at the first header: stays
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn summary_counts_files_and_changes() {
+        let review = vec![
+            changed(
+                "a.go",
+                vec![
+                    added(item("A", "func A()")),
+                    modified(item("B", "func B()"), item("B", "func B(x int)")),
+                    removed(item("C", "func C()")),
+                ],
+            ),
+            FileChange {
+                path: PathBuf::from("gone.go"),
+                kind: FileChangeKind::Deleted,
+            },
+        ];
+        assert_eq!(summarize(&review), "2 files · +1 ~1 -1");
+        assert_eq!(summarize(&review[..1]), "1 file · +1 ~1 -1");
+    }
+
+    #[test]
+    fn input_decodes_enter_as_open() {
+        let mut input = InputState::default();
+        assert_eq!(input.feed(KeyCode::Enter, false), Some(Motion::Open));
+    }
+
+    #[test]
+    fn input_decodes_tab_as_expand() {
+        let mut input = InputState::default();
+        assert_eq!(input.feed(KeyCode::Tab, false), Some(Motion::Expand));
+    }
+
+    #[test]
+    fn tokenize_keeps_word_runs_whole() {
+        assert_eq!(
+            tokenize("func F(x int)"),
+            vec!["func", " ", "F", "(", "x", " ", "int", ")"]
+        );
+    }
+
+    #[test]
+    fn modified_rows_mark_only_the_changed_tokens() {
+        let rendered = render(&[changed(
+            "a.go",
+            vec![modified(item("B", "func B()"), item("B", "func B(x int)"))],
+        )]);
+        // Row text is unchanged by the span split…
+        assert_eq!(text(&rendered.lines[1]), "  ~ func B(x int)");
+        // …and the inserted parameter is the marked region.
+        let marked: String = rendered.lines[1]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, "x int");
+        // The old side has nothing struck out — nothing was removed.
+        assert!(
+            rendered.lines[2]
+                .spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::CROSSED_OUT))
+        );
+    }
+
+    #[test]
+    fn modified_rows_strike_removed_tokens_on_the_was_line() {
+        let rendered = render(&[changed(
+            "a.go",
+            vec![modified(
+                item("B", "func B(retries int)"),
+                item("B", "func B()"),
+            )],
+        )]);
+        let struck: String = rendered.lines[2]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::CROSSED_OUT))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(struck, "retries int");
+    }
+
+    /// An index defining `Client` with one field, and a review whose one
+    /// item references `Client`.
+    fn expandable_app() -> App {
+        let mut client = item("Client", "type Client struct");
+        client.id.kind = Kind::Struct;
+        let mut field = item("Client.timeout", "Client.timeout int");
+        field.id.kind = Kind::Field;
+        field.parent = Some("Client".into());
+        let mut client_surface = crate::surface::Surface::new();
+        client_surface.push(client);
+        client_surface.push(field);
+        let index = TypeIndex::build(&[client_surface]);
+
+        let mut connect = item("Connect", "func Connect() *Client");
+        connect.refs = vec![crate::item::TypeRef("Client".into())];
+        App::new(&[changed("a.go", vec![added(connect)])], index)
+    }
+
+    #[test]
+    fn tab_expands_referenced_types_inline_and_collapses_again() {
+        let mut app = expandable_app();
+        app.viewport_height = 20;
+        assert_eq!(app.lines.len(), 2); // header + row
+        assert_eq!(app.expandable, vec![false, true]);
+
+        app.cursor = 1;
+        assert_eq!(app.toggle_expand(), None);
+        let texts: Vec<String> = app.lines.iter().map(text).collect();
+        assert_eq!(texts[2], "      ▸ type Client struct  · f.go:1");
+        assert_eq!(texts[3], "            Client.timeout int");
+        // Expansion rows are not stops; the cursor's stop is unchanged.
+        assert_eq!(app.stops.len(), 2);
+        assert_eq!(app.cursor, 1);
+
+        assert_eq!(app.toggle_expand(), None);
+        assert_eq!(app.lines.len(), 2);
+    }
+
+    #[test]
+    fn tab_on_an_unexpandable_row_notices() {
+        let mut app = expandable_app();
+        app.viewport_height = 20;
+        app.cursor = 0; // the file header
+        assert!(app.toggle_expand().is_some());
+        assert_eq!(app.lines.len(), 2);
+    }
+
+    #[test]
+    fn stops_jump_to_head_side_lines() {
+        let with_lines = |name: &str, sig: &str, line: u32| {
+            let mut i = item(name, sig);
+            i.line = crate::item::Line(line);
+            i
+        };
+        let app = app(&[
+            changed(
+                "a.go",
+                vec![
+                    added(with_lines("A", "func A()", 10)),
+                    modified(
+                        with_lines("B", "func B()", 12),
+                        with_lines("B", "func B(x int)", 20),
+                    ),
+                    removed(with_lines("C", "func C()", 30)),
+                ],
+            ),
+            FileChange {
+                path: PathBuf::from("gone.go"),
+                kind: FileChangeKind::Deleted,
+            },
+        ]);
+        let jump = |i: usize| app.jumps[i].clone();
+        // File header jumps to the top of the file.
+        assert_eq!(
+            jump(0),
+            Some(JumpTarget {
+                path: PathBuf::from("a.go"),
+                line: crate::item::Line(1),
+            })
+        );
+        // Added jumps to its line; modified to the *after* line.
+        assert_eq!(jump(1).unwrap().line, crate::item::Line(10));
+        assert_eq!(jump(2).unwrap().line, crate::item::Line(20));
+        // Removed items and deleted files have nowhere to go.
+        assert_eq!(jump(3), None);
+        assert_eq!(jump(4), None);
+    }
+
+    #[test]
+    fn current_jump_follows_the_cursor() {
+        let mut app = app(&[changed("a.go", vec![added(item("A", "func A()"))])]);
+        app.viewport_height = 10;
+        assert_eq!(app.current_jump().unwrap().line, crate::item::Line(1));
+        app.cursor_down(1);
+        assert_eq!(app.current_jump().unwrap().path, PathBuf::from("a.go"));
+    }
+
+    #[test]
     fn input_decodes_match_navigation() {
         let mut input = InputState::default();
         assert_eq!(
@@ -861,10 +1524,10 @@ mod tests {
 
     /// Three files, one item each, so every stop carries a distinct name.
     fn three_files() -> App {
-        App::new(&[
-            changed("a.go", vec![Change::Added(item("Alpha", "func Alpha()"))]),
-            changed("b.go", vec![Change::Added(item("Beta", "func Beta()"))]),
-            changed("c.go", vec![Change::Added(item("Gamma", "func Gamma()"))]),
+        app(&[
+            changed("a.go", vec![added(item("Alpha", "func Alpha()"))]),
+            changed("b.go", vec![added(item("Beta", "func Beta()"))]),
+            changed("c.go", vec![added(item("Gamma", "func Gamma()"))]),
         ])
     }
 

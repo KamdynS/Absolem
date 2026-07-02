@@ -12,9 +12,12 @@ engine feeds an interactive TUI, a Neovim plugin (review with native
 go-to-def / find-refs), and a CI pipeline comment. They look like three
 products; they share a *symbol graph*. Unify at the core, vary the chrome.
 
-**The current target** is the smallest end-to-end thing: a syntactic TUI
-showing what items changed in a Go MR. Everything beyond is direction, not
-specification — the project will morph as code lands.
+**The current state**: the syntactic tier is end-to-end for Go and Rust —
+member-level extraction (fields, variants, interface/trait methods), four
+frontends (TUI, plain, JSON, markdown), arbitrary ref ranges, and a TUI
+jump to `$EDITOR`. **The current target** is the semantic tier: Go via
+gopls (resolved TypeRefs, real navigation). Everything beyond is
+direction, not specification — the project morphs as code lands.
 
 ## Backend/frontend — the load-bearing distinction
 
