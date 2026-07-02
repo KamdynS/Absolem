@@ -83,6 +83,10 @@ struct Cli {
     #[arg(long, short = 'w')]
     worktree: bool,
 
+    /// Fetch and review a pull/merge request from origin by number.
+    #[arg(long, conflicts_with_all = ["range", "worktree"])]
+    pr: Option<u32>,
+
     #[command(flatten)]
     output: OutputFlags,
 }
@@ -144,7 +148,19 @@ fn main() -> Result<()> {
         .context("not inside a git repository")?;
     let git = RealGit::new(repo_root.clone());
 
-    let range = resolve_range(&git, cli.range.as_deref(), cli.worktree)?;
+    let range = match cli.pr {
+        Some(number) => {
+            let head = git
+                .fetch_pr_head(number)
+                .with_context(|| format!("failed to fetch PR/MR {number} from origin"))?;
+            RefRange {
+                base: resolve_base(&git)?,
+                head: Rev::Ref(head),
+                mode: DiffMode::MergeBase,
+            }
+        }
+        None => resolve_range(&git, cli.range.as_deref(), cli.worktree)?,
+    };
     let changed = git
         .changed_files(&range)
         .with_context(|| format!("git diff {}..{} failed", range.base, range.head))?;
@@ -382,6 +398,10 @@ mod tests {
 
         fn ls_files(&self, _rev: &Rev) -> Result<Vec<PathBuf>, GitError> {
             Ok(self.files.iter().map(|f| f.path.clone()).collect())
+        }
+
+        fn fetch_pr_head(&self, _number: u32) -> Result<String, GitError> {
+            Ok("FETCH_HEAD".to_owned())
         }
     }
 

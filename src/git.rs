@@ -105,6 +105,21 @@ pub(crate) trait GitRepo {
     /// Every file in the tree at `rev`, repo-relative. Feeds the
     /// head-wide type index that resolves `TypeRef`s by name.
     fn ls_files(&self, rev: &Rev) -> Result<Vec<PathBuf>, GitError>;
+
+    /// Fetch the head of forge pull/merge request `number` from origin
+    /// and return a rev that resolves to it.
+    fn fetch_pr_head(&self, number: u32) -> Result<String, GitError>;
+}
+
+/// The ref a forge publishes a PR/MR head under, chosen from the origin
+/// URL: GitLab uses `refs/merge-requests/`, GitHub (and the Gitea
+/// family) use `refs/pull/`.
+fn pr_refspec(origin_url: &str, number: u32) -> String {
+    if origin_url.contains("gitlab") {
+        format!("refs/merge-requests/{number}/head")
+    } else {
+        format!("refs/pull/{number}/head")
+    }
 }
 
 pub(crate) struct RealGit {
@@ -210,6 +225,13 @@ impl GitRepo for RealGit {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect())
+    }
+
+    fn fetch_pr_head(&self, number: u32) -> Result<String, GitError> {
+        let origin = self.run_checked(&["remote", "get-url", "origin"])?;
+        let refspec = pr_refspec(origin.trim(), number);
+        self.run_checked(&["fetch", "origin", &refspec])?;
+        Ok("FETCH_HEAD".to_owned())
     }
 }
 
@@ -317,6 +339,22 @@ mod tests {
             mode: DiffMode::Direct,
         };
         assert_eq!(two.to_git_range(), "v1..v2");
+    }
+
+    #[test]
+    fn pr_refspec_follows_the_forge() {
+        assert_eq!(
+            pr_refspec("https://github.com/acme/widgets.git", 7),
+            "refs/pull/7/head"
+        );
+        assert_eq!(
+            pr_refspec("git@gitlab.com:acme/widgets.git", 7),
+            "refs/merge-requests/7/head"
+        );
+        assert_eq!(
+            pr_refspec("https://gitlab.example.com/acme/widgets.git", 12),
+            "refs/merge-requests/12/head"
+        );
     }
 
     #[test]
