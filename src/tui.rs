@@ -654,7 +654,11 @@ impl LineBuilder {
                 line,
             })
         };
-        let expandable = view.item.refs.iter().any(|r| index.lookup(&r.0).is_some());
+        let expandable = view
+            .item
+            .refs
+            .iter()
+            .any(|r| index.lookup(&r.0, &view.item.id.path).is_some());
         match &view.status {
             ItemStatus::Added => {
                 self.stop(
@@ -696,14 +700,25 @@ impl LineBuilder {
 
     /// The definitions of the types `view` references, as non-stop
     /// context lines: each resolved ref renders its signature, where it
-    /// lives, and its members.
+    /// lives (with a note when the name has competing definitions), and
+    /// its members.
     fn expansion(&mut self, view: &ItemView, indent: usize, index: &TypeIndex) {
         let pad = " ".repeat(indent + 4);
         for r in &view.item.refs {
-            let Some(def) = index.lookup(&r.0) else {
+            let Some(resolved) = index.lookup(&r.0, &view.item.id.path) else {
                 continue;
             };
-            let at = format!("  · {}:{}", def.item.id.path.display(), def.item.line);
+            let def = resolved.def;
+            let at = if resolved.candidates > 1 {
+                format!(
+                    "  · {}:{} (1 of {} definitions)",
+                    def.item.id.path.display(),
+                    def.item.line,
+                    resolved.candidates
+                )
+            } else {
+                format!("  · {}:{}", def.item.id.path.display(), def.item.line)
+            };
             self.lines.push(
                 Line::from(vec![
                     Span::raw(format!("{pad}▸ {}", def.item.signature)),
