@@ -15,6 +15,11 @@ use std::path::Path;
 use crate::core::{ChangeSet, FileChange, FileChangeKind, ItemStatus, ItemView};
 
 pub(crate) fn render_review(out: &mut impl Write, review: &[FileChange]) -> io::Result<()> {
+    // An empty review is a finding, not a failure: the change touched
+    // no API surface. Say so rather than printing nothing.
+    if review.is_empty() {
+        return writeln!(out, "No structural changes — the API surface is untouched.");
+    }
     for (i, file) in review.iter().enumerate() {
         if i > 0 {
             writeln!(out)?;
@@ -114,8 +119,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_review_renders_nothing() {
-        assert_eq!(render(&[]), "");
+    fn empty_review_says_the_surface_is_untouched() {
+        assert_eq!(
+            render(&[]),
+            "No structural changes — the API surface is untouched.\n"
+        );
     }
 
     #[test]

@@ -731,7 +731,8 @@ impl LineBuilder {
 fn render_lines(review: &[FileChange], expanded: &HashSet<usize>, index: &TypeIndex) -> Rendered {
     let mut b = LineBuilder::default();
     if review.is_empty() {
-        b.lines.push(Line::from("No structural changes.").dim());
+        b.lines
+            .push(Line::from("No structural changes — the API surface is untouched.").dim());
         return Rendered {
             lines: b.lines,
             stops: b.stops,
@@ -1035,7 +1036,10 @@ mod tests {
     fn empty_review_shows_placeholder() {
         let rendered = render(&[]);
         assert_eq!(rendered.lines.len(), 1);
-        assert_eq!(text(&rendered.lines[0]), "No structural changes.");
+        assert_eq!(
+            text(&rendered.lines[0]),
+            "No structural changes — the API surface is untouched."
+        );
         assert!(rendered.stops.is_empty());
     }
 

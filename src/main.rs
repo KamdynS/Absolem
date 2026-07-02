@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn body_only_change_renders_nothing() {
+    fn body_only_change_reports_an_untouched_surface() {
         let mut contents = HashMap::new();
         contents.insert(
             "origin/main:f.go".into(),
@@ -644,7 +644,10 @@ mod tests {
             contents,
             ..Default::default()
         };
-        assert_eq!(render_all(&git), "");
+        assert_eq!(
+            render_all(&git),
+            "No structural changes — the API surface is untouched.\n"
+        );
     }
 
     #[test]

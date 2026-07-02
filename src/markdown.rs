@@ -16,7 +16,10 @@ pub(crate) fn render_markdown(out: &mut impl Write, review: &[FileChange]) -> io
     writeln!(out, "### absolem — shape of the change")?;
     if review.is_empty() {
         writeln!(out)?;
-        writeln!(out, "_No structural changes._")?;
+        writeln!(
+            out,
+            "_No structural changes — the API surface is untouched._"
+        )?;
         return Ok(());
     }
     for file in review {
@@ -113,7 +116,7 @@ mod tests {
     fn empty_review_says_so() {
         assert_eq!(
             render(&[]),
-            "### absolem — shape of the change\n\n_No structural changes._\n"
+            "### absolem — shape of the change\n\n_No structural changes — the API surface is untouched._\n"
         );
     }
 
