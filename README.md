@@ -38,7 +38,9 @@ exactly the tokens that changed.
 
 `Tab` expands the types the current row references — the definition and
 members of a signature's parameter or return types unfold inline,
-resolved by name against the whole tree at head. `Enter` opens the item
+resolved by name against the whole tree at head. (One level deep for
+now: expanded rows are context only and can't themselves be expanded or
+jumped into.) `Enter` opens the item
 at its line in `$VISUAL`/`$EDITOR` (strictly those; if neither is set,
 absolem tells you rather than guessing an editor).
 
