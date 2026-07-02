@@ -2,9 +2,11 @@
 name = "absolem"
 version = "0.1.0"
 edition = "2024"
-license = "TBD"
-repository = "TBD"
+license = "MIT"
+repository = "https://github.com/KamdynS/Absolem"
 description = "Surface the structural shape of a change before review."
+keywords = ["code-review", "diff", "tree-sitter", "git", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
@@ -30,8 +32,6 @@ missing_panics_doc       = "allow"
 cast_precision_loss      = "allow"
 cast_possible_truncation = "allow"
 
-# --- Cargo lints that fire on placeholder metadata while license/repo are TBD ---
-cargo_common_metadata    = "allow"
 multiple_crate_versions  = "allow"  # tree-sitter pulls duplicate semver versions
 
 # --- Nursery lints that conflict with STYLE §5 in a bin crate ---
