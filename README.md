@@ -17,19 +17,24 @@ are. The name nods to Alice's caterpillar.
 absolem                    # review origin/main...HEAD in the TUI
 absolem main..v2.0         # any range; .. and ... keep git semantics
 absolem release            # bare base, head defaults to HEAD
+absolem --worktree         # your uncommitted work, untracked files included
+absolem HEAD.. -w          # just the uncommitted delta
+absolem --pr 42            # fetch and review a PR/MR from origin by number
 absolem --plain            # plain text (also the default when piped)
 absolem --json             # schema-versioned JSON for machine consumers
 absolem --markdown         # forge-flavored markdown for a CI comment
 ```
 
 A bare base and `...` compare against the merge base — what GitHub and
-GitLab show on a PR. `..` diffs the two trees directly.
+GitLab show on a PR. `..` diffs the two trees directly. Runs from any
+directory inside the repo; without a remote it falls back to your local
+`main`/`master` as the base.
 
 Output marks each item `+` added, `-` removed, `~` modified (with the
 old signature beneath). A changed composite renders **whole** — every
 field, variant, or method listed, unchanged members as dimmed context,
 the changes in place. Files whose API shape did not move are omitted; a
-body-only edit renders nothing, by design.
+body-only change reports exactly that: no structural changes.
 
 ### The TUI
 
