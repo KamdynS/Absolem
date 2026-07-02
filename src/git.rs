@@ -1,5 +1,6 @@
 //! The `GitRepo` capability and its real shell-out-to-`git` implementation.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +12,26 @@ pub(crate) enum GitError {
     GitFailed { status: i32, stderr: String },
     #[error("unexpected git output: {0}")]
     UnexpectedOutput(String),
+    #[error("failed to read {path} from the working tree: {reason}")]
+    WorktreeRead { path: String, reason: String },
+}
+
+/// A reviewable state of the tree: a committed ref, or the working tree
+/// as it sits on disk, uncommitted changes and all. Only the head side
+/// of a review may be the working tree — the base is always a ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rev {
+    Ref(String),
+    WorkingTree,
+}
+
+impl fmt::Display for Rev {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ref(name) => name.fmt(f),
+            Self::WorkingTree => "worktree".fmt(f),
+        }
+    }
 }
 
 /// How the two refs of a review are compared.
@@ -23,21 +44,30 @@ pub(crate) enum DiffMode {
     Direct,
 }
 
-/// The pair of refs under review, plus the semantics for comparing them.
+/// The two sides under review, plus the semantics for comparing them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefRange {
     pub(crate) base: String,
-    pub(crate) head: String,
+    pub(crate) head: Rev,
     pub(crate) mode: DiffMode,
 }
 
 impl RefRange {
+    /// The argument `git diff` expects. Git's own grammar already covers
+    /// the working tree: a bare `base` diffs it directly, `base...`
+    /// diffs it against the merge base.
     fn to_git_range(&self) -> String {
         let dots = match self.mode {
             DiffMode::MergeBase => "...",
             DiffMode::Direct => "..",
         };
-        format!("{}{}{}", self.base, dots, self.head)
+        match &self.head {
+            Rev::Ref(head) => format!("{}{}{}", self.base, dots, head),
+            Rev::WorkingTree => match self.mode {
+                DiffMode::MergeBase => format!("{}...", self.base),
+                DiffMode::Direct => self.base.clone(),
+            },
+        }
     }
 }
 
@@ -68,12 +98,13 @@ pub(crate) trait GitRepo {
     /// misattributed to the branch.
     fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError>;
 
-    /// Read the contents of `path` at revision `rev`.
-    fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError>;
+    /// Read the contents of `path` at `rev` — a committed ref or the
+    /// working tree.
+    fn read_at(&self, rev: &Rev, path: &Path) -> Result<String, GitError>;
 
     /// Every file in the tree at `rev`, repo-relative. Feeds the
     /// head-wide type index that resolves `TypeRef`s by name.
-    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError>;
+    fn ls_files(&self, rev: &Rev) -> Result<Vec<PathBuf>, GitError>;
 }
 
 pub(crate) struct RealGit {
@@ -125,20 +156,55 @@ impl GitRepo for RealGit {
 
     fn changed_files(&self, range: &RefRange) -> Result<Vec<ChangedFile>, GitError> {
         let raw = self.run_checked(&["diff", "--name-status", "-z", &range.to_git_range()])?;
-        parse_name_status(&raw)
+        let mut files = parse_name_status(&raw)?;
+        // `git diff` never reports untracked files, but a brand-new
+        // uncommitted file is exactly what a working-tree review is for.
+        if range.head == Rev::WorkingTree {
+            let untracked =
+                self.run_checked(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+            files.extend(
+                untracked
+                    .split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(|path| ChangedFile {
+                        path: PathBuf::from(path),
+                        status: ChangeStatus::Added,
+                    }),
+            );
+        }
+        Ok(files)
     }
 
     fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError> {
         Ok(self.run_checked(&["merge-base", a, b])?.trim().to_owned())
     }
 
-    fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError> {
-        let spec = format!("{}:{}", rev, path.display());
-        self.run_checked(&["show", &spec])
+    fn read_at(&self, rev: &Rev, path: &Path) -> Result<String, GitError> {
+        match rev {
+            Rev::Ref(name) => {
+                let spec = format!("{}:{}", name, path.display());
+                self.run_checked(&["show", &spec])
+            }
+            Rev::WorkingTree => std::fs::read_to_string(self.repo_dir.join(path)).map_err(|e| {
+                GitError::WorktreeRead {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                }
+            }),
+        }
     }
 
-    fn ls_files(&self, rev: &str) -> Result<Vec<PathBuf>, GitError> {
-        let raw = self.run_checked(&["ls-tree", "-r", "--name-only", "-z", rev])?;
+    fn ls_files(&self, rev: &Rev) -> Result<Vec<PathBuf>, GitError> {
+        let raw = match rev {
+            Rev::Ref(name) => self.run_checked(&["ls-tree", "-r", "--name-only", "-z", name])?,
+            Rev::WorkingTree => self.run_checked(&[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])?,
+        };
         Ok(raw
             .split('\0')
             .filter(|s| !s.is_empty())
@@ -241,15 +307,31 @@ mod tests {
     fn ref_range_formats_dot_count_from_semantics() {
         let three = RefRange {
             base: "main".into(),
-            head: "HEAD".into(),
+            head: Rev::Ref("HEAD".into()),
             mode: DiffMode::MergeBase,
         };
         assert_eq!(three.to_git_range(), "main...HEAD");
         let two = RefRange {
             base: "v1".into(),
-            head: "v2".into(),
+            head: Rev::Ref("v2".into()),
             mode: DiffMode::Direct,
         };
         assert_eq!(two.to_git_range(), "v1..v2");
+    }
+
+    #[test]
+    fn ref_range_uses_git_worktree_grammar() {
+        let merge_base = RefRange {
+            base: "main".into(),
+            head: Rev::WorkingTree,
+            mode: DiffMode::MergeBase,
+        };
+        assert_eq!(merge_base.to_git_range(), "main...");
+        let direct = RefRange {
+            base: "main".into(),
+            head: Rev::WorkingTree,
+            mode: DiffMode::Direct,
+        };
+        assert_eq!(direct.to_git_range(), "main");
     }
 }

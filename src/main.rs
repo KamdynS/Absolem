@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 use crate::core::{FileChange, FileChangeKind, TypeIndex, diff};
-use crate::git::{ChangeStatus, ChangedFile, DiffMode, GitRepo, RealGit, RefRange};
+use crate::git::{ChangeStatus, ChangedFile, DiffMode, GitRepo, RealGit, RefRange, Rev};
 use crate::item::Line;
 use crate::producer::{Producer, ProducerError, Registry};
 use crate::surface::Surface;
@@ -77,6 +77,20 @@ struct Cli {
     /// trees directly. Defaults to origin/main (or origin/master)...HEAD.
     range: Option<String>,
 
+    /// Review the working tree — uncommitted changes and untracked
+    /// files included — instead of HEAD. Combines with a base
+    /// (`absolem main --worktree`) but not with an explicit head.
+    #[arg(long, short = 'w')]
+    worktree: bool,
+
+    #[command(flatten)]
+    output: OutputFlags,
+}
+
+/// The mutually exclusive output selectors, grouped: they are one
+/// choice, resolved to an `OutputMode` once at startup.
+#[derive(clap::Args, Debug)]
+struct OutputFlags {
     /// Print plain text instead of opening the interactive view. The
     /// default already falls back to plain text when stdout is not a
     /// terminal, so this is for forcing it (e.g. piping into a pager).
@@ -106,11 +120,11 @@ enum OutputMode {
 
 impl Cli {
     fn output_mode(&self) -> OutputMode {
-        if self.json {
+        if self.output.json {
             OutputMode::Json
-        } else if self.markdown {
+        } else if self.output.markdown {
             OutputMode::Markdown
-        } else if self.plain || !std::io::stdout().is_terminal() {
+        } else if self.output.plain || !std::io::stdout().is_terminal() {
             OutputMode::Plain
         } else {
             OutputMode::Interactive
@@ -130,7 +144,7 @@ fn main() -> Result<()> {
         .context("not inside a git repository")?;
     let git = RealGit::new(repo_root.clone());
 
-    let range = resolve_range(&git, cli.range.as_deref())?;
+    let range = resolve_range(&git, cli.range.as_deref(), cli.worktree)?;
     let changed = git
         .changed_files(&range)
         .with_context(|| format!("git diff {}..{} failed", range.base, range.head))?;
@@ -143,11 +157,19 @@ fn main() -> Result<()> {
 
     // Three-dot reviews compare against the merge base, so base content
     // must be read there — not at the base tip, which may have moved on.
+    // The working tree's merge base is HEAD's.
     let base_rev = match range.mode {
-        DiffMode::MergeBase => git
-            .merge_base(&range.base, &range.head)
-            .with_context(|| format!("git merge-base {} {} failed", range.base, range.head))?,
-        DiffMode::Direct => range.base.clone(),
+        DiffMode::MergeBase => {
+            let head_commit = match &range.head {
+                Rev::Ref(name) => name.as_str(),
+                Rev::WorkingTree => "HEAD",
+            };
+            let sha = git
+                .merge_base(&range.base, head_commit)
+                .with_context(|| format!("git merge-base {} {head_commit} failed", range.base))?;
+            Rev::Ref(sha)
+        }
+        DiffMode::Direct => Rev::Ref(range.base.clone()),
     };
 
     let review = build_review(&git, &mut registry, &base_rev, &range.head, &source_files)?;
@@ -184,8 +206,8 @@ fn main() -> Result<()> {
 fn build_review(
     git: &impl GitRepo,
     registry: &mut Registry,
-    base_rev: &str,
-    head_rev: &str,
+    base_rev: &Rev,
+    head_rev: &Rev,
     files: &[ChangedFile],
 ) -> Result<Vec<FileChange>> {
     let mut review = Vec::new();
@@ -220,7 +242,7 @@ fn build_review(
 /// resolves type expansions against. Best-effort by design: a file that
 /// fails to read or parse is skipped, never fatal — the index only
 /// powers an optional affordance, not the review itself.
-fn build_type_index(git: &impl GitRepo, registry: &mut Registry, head: &str) -> TypeIndex {
+fn build_type_index(git: &impl GitRepo, registry: &mut Registry, head: &Rev) -> TypeIndex {
     let Ok(files) = git.ls_files(head) else {
         return TypeIndex::default();
     };
@@ -242,12 +264,12 @@ fn build_type_index(git: &impl GitRepo, registry: &mut Registry, head: &str) -> 
 fn surface_at(
     git: &impl GitRepo,
     producer: &mut dyn Producer,
-    rev: &str,
+    rev: &Rev,
     path: &Path,
 ) -> Result<Surface> {
     let source = git
         .read_at(rev, path)
-        .with_context(|| format!("git show {rev}:{} failed", path.display()))?;
+        .with_context(|| format!("failed to read {}@{rev}", path.display()))?;
     producer
         .extract(path, &source)
         .map_err(|e: ProducerError| anyhow!(e))
@@ -255,19 +277,25 @@ fn surface_at(
 }
 
 /// Turns the optional CLI argument into a concrete `RefRange`. A missing
-/// or empty side falls back to the default: origin/main (or
-/// origin/master) for the base, HEAD for the head.
-fn resolve_range(git: &impl GitRepo, raw: Option<&str>) -> Result<RefRange> {
+/// or empty side falls back to the default: origin/main (or a fallback
+/// base) for the base; HEAD — or the working tree under `--worktree` —
+/// for the head.
+fn resolve_range(git: &impl GitRepo, raw: Option<&str>, worktree: bool) -> Result<RefRange> {
     let (base, head, mode) = raw.map_or((None, None, DiffMode::MergeBase), parse_range);
     let base = match base {
         Some(b) => b.to_owned(),
         None => resolve_base(git)?,
     };
-    Ok(RefRange {
-        base,
-        head: head.unwrap_or("HEAD").to_owned(),
-        mode,
-    })
+    let head = match (worktree, head) {
+        (true, Some(head)) => {
+            return Err(anyhow!(
+                "--worktree replaces the head side; `{head}` cannot also be given"
+            ));
+        }
+        (true, None) => Rev::WorkingTree,
+        (false, head) => Rev::Ref(head.unwrap_or("HEAD").to_owned()),
+    };
+    Ok(RefRange { base, head, mode })
 }
 
 /// A range side that was present and non-empty.
@@ -344,7 +372,7 @@ mod tests {
             Ok(a.to_owned())
         }
 
-        fn read_at(&self, rev: &str, path: &Path) -> Result<String, GitError> {
+        fn read_at(&self, rev: &Rev, path: &Path) -> Result<String, GitError> {
             let key = format!("{}:{}", rev, path.display());
             self.contents
                 .get(&key)
@@ -352,14 +380,21 @@ mod tests {
                 .ok_or_else(|| GitError::UnexpectedOutput(format!("no content for {key}")))
         }
 
-        fn ls_files(&self, _rev: &str) -> Result<Vec<PathBuf>, GitError> {
+        fn ls_files(&self, _rev: &Rev) -> Result<Vec<PathBuf>, GitError> {
             Ok(self.files.iter().map(|f| f.path.clone()).collect())
         }
     }
 
     fn render_all(git: &FakeGit) -> String {
         let mut registry = Registry::with_defaults().unwrap();
-        let review = build_review(git, &mut registry, "origin/main", "HEAD", &git.files).unwrap();
+        let review = build_review(
+            git,
+            &mut registry,
+            &Rev::Ref("origin/main".into()),
+            &Rev::Ref("HEAD".into()),
+            &git.files,
+        )
+        .unwrap();
         let mut buf: Vec<u8> = Vec::new();
         render::render_review(&mut buf, &review).unwrap();
         String::from_utf8(buf).unwrap()
@@ -444,38 +479,64 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_range(&git, None).unwrap(),
+            resolve_range(&git, None, false).unwrap(),
             RefRange {
                 base: "origin/main".into(),
-                head: "HEAD".into(),
+                head: Rev::Ref("HEAD".into()),
                 mode: DiffMode::MergeBase,
             }
         );
         assert_eq!(
-            resolve_range(&git, Some("v1.0..v2.0")).unwrap(),
+            resolve_range(&git, Some("v1.0..v2.0"), false).unwrap(),
             RefRange {
                 base: "v1.0".into(),
-                head: "v2.0".into(),
+                head: Rev::Ref("v2.0".into()),
                 mode: DiffMode::Direct,
             }
         );
         assert_eq!(
-            resolve_range(&git, Some("release")).unwrap(),
+            resolve_range(&git, Some("release"), false).unwrap(),
             RefRange {
                 base: "release".into(),
-                head: "HEAD".into(),
+                head: Rev::Ref("HEAD".into()),
                 mode: DiffMode::MergeBase,
             }
         );
         // An empty base side falls back to the resolved default base.
         assert_eq!(
-            resolve_range(&git, Some("...feature")).unwrap(),
+            resolve_range(&git, Some("...feature"), false).unwrap(),
             RefRange {
                 base: "origin/main".into(),
-                head: "feature".into(),
+                head: Rev::Ref("feature".into()),
                 mode: DiffMode::MergeBase,
             }
         );
+    }
+
+    #[test]
+    fn worktree_flag_sets_the_head_side() {
+        let git = FakeGit {
+            main_exists: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_range(&git, None, true).unwrap(),
+            RefRange {
+                base: "origin/main".into(),
+                head: Rev::WorkingTree,
+                mode: DiffMode::MergeBase,
+            }
+        );
+        assert_eq!(
+            resolve_range(&git, Some("release"), true).unwrap(),
+            RefRange {
+                base: "release".into(),
+                head: Rev::WorkingTree,
+                mode: DiffMode::MergeBase,
+            }
+        );
+        // An explicit head cannot be combined with --worktree.
+        assert!(resolve_range(&git, Some("main..feature"), true).is_err());
     }
 
     #[test]
