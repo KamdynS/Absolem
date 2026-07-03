@@ -238,11 +238,19 @@ fn build_review(
         let Some(producer) = registry.for_path(&file.path) else {
             continue;
         };
-        let base_surface = match file.status {
+        let base_surface = match &file.status {
             ChangeStatus::Added => Surface::new(),
-            _ => surface_at(git, producer, base_rev, &file.path)?,
+            // A renamed file's base content lives at its old path, but
+            // is extracted under the new one so item identities line up
+            // and a rename-plus-tweak diffs as the tweak.
+            ChangeStatus::Renamed { from } => {
+                surface_at(git, producer, base_rev, from, &file.path)?
+            }
+            ChangeStatus::Modified | ChangeStatus::Deleted => {
+                surface_at(git, producer, base_rev, &file.path, &file.path)?
+            }
         };
-        let head_surface = surface_at(git, producer, head_rev, &file.path)?;
+        let head_surface = surface_at(git, producer, head_rev, &file.path, &file.path)?;
         let changeset = diff(&base_surface, &head_surface);
         if !changeset.is_empty() {
             review.push(FileChange {
@@ -277,19 +285,24 @@ fn build_type_index(git: &impl GitRepo, registry: &mut Registry, head: &Rev) -> 
     TypeIndex::build(&surfaces)
 }
 
+/// Extracts a Surface for the file at `read_path`@`rev`, keying its
+/// items under `identity_path`. The two differ only across a rename,
+/// where content is read from where it lived but identity follows the
+/// head-side path.
 fn surface_at(
     git: &impl GitRepo,
     producer: &mut dyn Producer,
     rev: &Rev,
-    path: &Path,
+    read_path: &Path,
+    identity_path: &Path,
 ) -> Result<Surface> {
     let source = git
-        .read_at(rev, path)
-        .with_context(|| format!("failed to read {}@{rev}", path.display()))?;
+        .read_at(rev, read_path)
+        .with_context(|| format!("failed to read {}@{rev}", read_path.display()))?;
     producer
-        .extract(path, &source)
+        .extract(identity_path, &source)
         .map_err(|e: ProducerError| anyhow!(e))
-        .with_context(|| format!("failed to parse {}@{rev}", path.display()))
+        .with_context(|| format!("failed to parse {}@{rev}", read_path.display()))
 }
 
 /// Turns the optional CLI argument into a concrete `RefRange`. A missing
