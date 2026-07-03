@@ -70,7 +70,9 @@ Each line names the rule, what drift looks like, what to do instead.
 - One layer, one concern, one MR. Keep changes reviewable.
 - Test against **fake capabilities**, not real IO. If a test needs a temp
   dir, a real clock, a subprocess, or the network, a capability wasn't
-  injected — fix the design, not the test (STYLE §3.5).
+  injected — fix the design, not the test (STYLE §3.5). The one
+  exception is the end-to-end suite in `tests/`, which exists precisely
+  to validate the real capability implementations against real git.
 - Use project vocabulary exactly (`Surface`, `Item`, `ItemId`, `TypeRef`,
   `ChangeSet`, `Producer`, `Tier`, `Frontend`). No synonyms.
 - Adding a dependency is a design event (STYLE §8). Justify it, or don't

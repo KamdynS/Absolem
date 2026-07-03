@@ -131,6 +131,12 @@ Because effects are injected, core logic is testable with trivial
 in-memory fakes — no temp dirs, real clocks, subprocesses, or network in
 unit tests. A test that needs IO is a smell: a capability wasn't injected.
 
+The inverse also holds: the *real* capability implementations cannot be
+validated by fakes, because a fake encodes the same assumptions a bug
+does. They get a deliberately small end-to-end suite in `tests/` — the
+one place real IO is legitimate — sized to mirror where boundary bugs
+actually appear, not to re-cover what the fakes already prove.
+
 ## 4. Error handling
 
 - **Library code:** typed errors via `thiserror`. No stringly-typed errors
