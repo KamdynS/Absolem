@@ -52,36 +52,23 @@ pub(crate) struct RefRange {
     pub(crate) mode: DiffMode,
 }
 
-impl RefRange {
-    /// The argument `git diff` expects. Git's own grammar already covers
-    /// the working tree: a bare `base` diffs it directly, `base...`
-    /// diffs it against the merge base.
-    fn to_git_range(&self) -> String {
-        let dots = match self.mode {
-            DiffMode::MergeBase => "...",
-            DiffMode::Direct => "..",
-        };
-        match &self.head {
-            Rev::Ref(head) => format!("{}{}{}", self.base, dots, head),
-            Rev::WorkingTree => match self.mode {
-                DiffMode::MergeBase => format!("{}...", self.base),
-                DiffMode::Direct => self.base.clone(),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChangedFile {
     pub(crate) path: PathBuf,
     pub(crate) status: ChangeStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChangeStatus {
     Added,
     Modified,
     Deleted,
+    /// Git recognized the same file moved; `from` is where the base
+    /// side's content lives. The review reads the old path but keys
+    /// items by the new one, so a rename-plus-tweak diffs as a tweak.
+    Renamed {
+        from: PathBuf,
+    },
 }
 
 pub(crate) trait GitRepo {
@@ -170,7 +157,17 @@ impl GitRepo for RealGit {
     }
 
     fn changed_files(&self, range: &RefRange) -> Result<Vec<ChangedFile>, GitError> {
-        let raw = self.run_checked(&["diff", "--name-status", "-z", &range.to_git_range()])?;
+        let range_arg = match (&range.head, range.mode) {
+            (Rev::Ref(head), DiffMode::MergeBase) => format!("{}...{}", range.base, head),
+            (Rev::Ref(head), DiffMode::Direct) => format!("{}..{}", range.base, head),
+            // A single rev diffs against the working tree. Git's
+            // three-dot grammar never reaches the worktree — an omitted
+            // side means HEAD — so the merge base is resolved here and
+            // used in the single-rev form.
+            (Rev::WorkingTree, DiffMode::Direct) => range.base.clone(),
+            (Rev::WorkingTree, DiffMode::MergeBase) => self.merge_base(&range.base, "HEAD")?,
+        };
+        let raw = self.run_checked(&["diff", "--name-status", "-z", &range_arg])?;
         let mut files = parse_name_status(&raw)?;
         // `git diff` never reports untracked files, but a brand-new
         // uncommitted file is exactly what a working-tree review is for.
@@ -237,8 +234,9 @@ impl GitRepo for RealGit {
 
 /// Parses `git diff --name-status -z` output. With `-z`, fields are
 /// NUL-separated and unquoted. For `A`/`M`/`D`/`T`: `STATUS\0PATH\0`.
-/// For `R`/`C`: `R<score>\0OLD_PATH\0NEW_PATH\0` — we keep the new path
-/// and treat the entry as `Modified`.
+/// For `R`/`C`: `R<score>\0OLD_PATH\0NEW_PATH\0`. A rename keeps its
+/// old path so the base side can be read from where it lived; a copy's
+/// new path simply did not exist at base, so it reviews as added.
 fn parse_name_status(output: &str) -> Result<Vec<ChangedFile>, GitError> {
     let mut result = Vec::new();
     let mut fields = output.split('\0').filter(|s| !s.is_empty());
@@ -252,9 +250,20 @@ fn parse_name_status(output: &str) -> Result<Vec<ChangedFile>, GitError> {
             'A' => (ChangeStatus::Added, fields.next()),
             'M' | 'T' => (ChangeStatus::Modified, fields.next()),
             'D' => (ChangeStatus::Deleted, fields.next()),
-            'R' | 'C' => {
+            'R' => {
+                let from = fields.next().ok_or_else(|| {
+                    GitError::UnexpectedOutput("rename entry missing its old path".into())
+                })?;
+                (
+                    ChangeStatus::Renamed {
+                        from: PathBuf::from(from),
+                    },
+                    fields.next(),
+                )
+            }
+            'C' => {
                 let _old = fields.next();
-                (ChangeStatus::Modified, fields.next())
+                (ChangeStatus::Added, fields.next())
             }
             _ => {
                 let _ = fields.next();
@@ -302,15 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_rename_keeps_new_path_as_modified() {
-        let input = "R100\0old.go\0new.go\0M\0other.go\0";
+    fn parses_rename_with_its_old_path_and_copy_as_added() {
+        let input = "R100\0old.go\0new.go\0C75\0src.go\0copy.go\0M\0other.go\0";
         let files = parse_name_status(input).unwrap();
         assert_eq!(
             files,
             vec![
                 ChangedFile {
                     path: "new.go".into(),
-                    status: ChangeStatus::Modified
+                    status: ChangeStatus::Renamed {
+                        from: "old.go".into()
+                    }
+                },
+                ChangedFile {
+                    path: "copy.go".into(),
+                    status: ChangeStatus::Added
                 },
                 ChangedFile {
                     path: "other.go".into(),
@@ -323,22 +338,6 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_list() {
         assert!(parse_name_status("").unwrap().is_empty());
-    }
-
-    #[test]
-    fn ref_range_formats_dot_count_from_semantics() {
-        let three = RefRange {
-            base: "main".into(),
-            head: Rev::Ref("HEAD".into()),
-            mode: DiffMode::MergeBase,
-        };
-        assert_eq!(three.to_git_range(), "main...HEAD");
-        let two = RefRange {
-            base: "v1".into(),
-            head: Rev::Ref("v2".into()),
-            mode: DiffMode::Direct,
-        };
-        assert_eq!(two.to_git_range(), "v1..v2");
     }
 
     #[test]
@@ -355,21 +354,5 @@ mod tests {
             pr_refspec("https://gitlab.example.com/acme/widgets.git", 12),
             "refs/merge-requests/12/head"
         );
-    }
-
-    #[test]
-    fn ref_range_uses_git_worktree_grammar() {
-        let merge_base = RefRange {
-            base: "main".into(),
-            head: Rev::WorkingTree,
-            mode: DiffMode::MergeBase,
-        };
-        assert_eq!(merge_base.to_git_range(), "main...");
-        let direct = RefRange {
-            base: "main".into(),
-            head: Rev::WorkingTree,
-            mode: DiffMode::Direct,
-        };
-        assert_eq!(direct.to_git_range(), "main");
     }
 }
